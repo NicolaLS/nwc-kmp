@@ -1,9 +1,9 @@
- [versions]
+[versions]
 agp = "8.12.3"
 kotlin = "2.2.20"
 android-minSdk = "24"
 android-compileSdk = "36"
-multiplatformCryptoLibsodiumBindings = "0.9.2"
+multiplatformCryptoLibsodiumBindings = "0.9.4"
 vanniktechMavenPublish = "0.34.0"
 kotlin-serialization = "1.9.0"
 kotlinx-coroutines = "1.10.2"
