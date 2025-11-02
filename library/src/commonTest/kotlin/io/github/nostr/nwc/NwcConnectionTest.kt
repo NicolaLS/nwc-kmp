@@ -35,14 +35,30 @@ class NwcConnectionTest {
         val original = "nostr+walletconnect://$samplePubkey?relay=wss://relay.example&secret=$sampleSecret&lud16=alice@example.com"
         val uri = "  $original  "
 
-        val parsed = parseNwcUriComponents(uri)
+        val parsed = NwcUri.parse(uri)
 
-        assertEquals(original, parsed.original)
-        assertEquals(samplePubkey, parsed.walletPublicKey.toString())
+        assertEquals(original.trim(), parsed.raw)
+        assertEquals(samplePubkey, parsed.walletPublicKeyHex)
         assertEquals(listOf("wss://relay.example"), parsed.relays)
-        assertEquals(sampleSecret, parsed.secretKey.hex)
+        assertEquals(sampleSecret, parsed.secretKeyHex)
         assertEquals("alice@example.com", parsed.lud16)
+        assertEquals(
+            "nostr+walletconnect://$samplePubkey?relay=wss://relay.example&secret=$sampleSecret&lud16=alice%40example.com",
+            parsed.toUriString()
+        )
         assertEquals(parsed.toCredentials(), parseNwcUri(uri))
+    }
+
+    @Test
+    fun credentialsProduceCanonicalUri() {
+        val credentials = parseNwcUri(
+            "nostr+walletconnect://${samplePubkey.uppercase()}?relay=wss://relay.example&secret=${sampleSecret.uppercase()}&lud16=alice@example.com"
+        )
+
+        val expected =
+            "nostr+walletconnect://$samplePubkey?relay=wss://relay.example&secret=${credentials.secretKeyHex}&lud16=alice%40example.com"
+        assertEquals(expected, credentials.toUriString())
+        assertEquals(expected, credentials.toUri().toUriString())
     }
 
     @Test

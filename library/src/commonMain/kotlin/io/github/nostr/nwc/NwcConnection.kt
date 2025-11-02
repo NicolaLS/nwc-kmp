@@ -3,19 +3,54 @@ package io.github.nostr.nwc
 import nostr.core.crypto.keys.PrivateKey
 import nostr.core.crypto.keys.PublicKey
 
-internal data class ParsedNwcUri(
-    val original: String,
+data class NwcUri internal constructor(
+    val raw: String,
     val walletPublicKey: PublicKey,
     val relays: List<String>,
     val secretKey: PrivateKey,
     val lud16: String?
 ) {
+    init {
+        require(relays.isNotEmpty()) { "Nostr Wallet Connect URI must include at least one relay" }
+    }
+
+    val walletPublicKeyHex: String get() = walletPublicKey.toString()
+    val secretKeyHex: String get() = secretKey.hex
+
     fun toCredentials(): NwcCredentials = NwcCredentials(
         walletPublicKey = walletPublicKey,
         relays = relays,
         secretKey = secretKey,
         lud16 = lud16
     )
+
+    fun toUriString(includeLud16: Boolean = true): String =
+        buildNwcUriString(walletPublicKeyHex, relays, secretKeyHex, if (includeLud16) lud16 else null)
+
+    override fun toString(): String = toUriString()
+
+    companion object {
+        fun parse(uri: String): NwcUri = parseNwcUriComponents(uri)
+
+        fun create(
+            walletPublicKey: PublicKey,
+            relays: List<String>,
+            secretKey: PrivateKey,
+            lud16: String? = null
+        ): NwcUri {
+            val normalizedRelays = normalizeRelays(relays)
+            require(normalizedRelays.isNotEmpty()) { "Nostr Wallet Connect URI must include at least one relay" }
+            val sanitizedLud16 = lud16?.takeIf { it.isNotBlank() }
+            val formatted = buildNwcUriString(walletPublicKey.toString(), normalizedRelays, secretKey.hex, sanitizedLud16)
+            return NwcUri(
+                raw = formatted,
+                walletPublicKey = walletPublicKey,
+                relays = normalizedRelays,
+                secretKey = secretKey,
+                lud16 = sanitizedLud16
+            )
+        }
+    }
 }
 
 data class NwcCredentials(
@@ -27,13 +62,27 @@ data class NwcCredentials(
     init {
         require(relays.isNotEmpty()) { "Nostr Wallet Connect URI must include at least one relay" }
     }
+
+    val walletPublicKeyHex: String get() = walletPublicKey.toString()
+    val secretKeyHex: String get() = secretKey.hex
+
+    fun toUri(includeLud16: Boolean = true): NwcUri =
+        NwcUri.create(
+            walletPublicKey = walletPublicKey,
+            relays = relays,
+            secretKey = secretKey,
+            lud16 = if (includeLud16) lud16 else null
+        )
+
+    fun toUriString(includeLud16: Boolean = true): String =
+        toUri(includeLud16).toUriString(includeLud16)
 }
 
 fun parseNwcUri(uri: String): NwcCredentials {
     return parseNwcUriComponents(uri).toCredentials()
 }
 
-internal fun parseNwcUriComponents(uri: String): ParsedNwcUri {
+internal fun parseNwcUriComponents(uri: String): NwcUri {
     val trimmed = uri.trim()
     require(trimmed.isNotEmpty()) { "Nostr Wallet Connect URI cannot be empty" }
     val (scheme, remainder) = extractScheme(trimmed)
@@ -60,11 +109,11 @@ internal fun parseNwcUriComponents(uri: String): ParsedNwcUri {
     }
     val secret = parameters["secret"]?.firstOrNull()?.trim()
     require(!secret.isNullOrEmpty()) { "Nostr Wallet Connect URI missing required secret parameter" }
-    val relayList = relays!!
+    val relayList = normalizeRelays(relays!!)
     val secretValue = secret!!.trim()
     val lud16 = parameters["lud16"]?.firstOrNull()?.takeIf { it.isNotBlank() }
-    return ParsedNwcUri(
-        original = trimmed,
+    return NwcUri(
+        raw = trimmed,
         walletPublicKey = walletPublicKey,
         relays = relayList,
         secretKey = PrivateKey.fromHex(secretValue),
@@ -138,3 +187,50 @@ private fun decodeComponent(value: String): String {
     }
     return builder.toString()
 }
+
+private fun encodeComponent(value: String): String {
+    if (value.isEmpty()) return ""
+    val builder = StringBuilder(value.length)
+    value.forEach { char ->
+        val keep = char.isLetterOrDigit() || char in setOf('-', '.', '_', '~', ':', '/')
+        if (keep) {
+            builder.append(char)
+        } else {
+            char.toString().encodeToByteArray().forEach { byte ->
+                val b = byte.toInt() and 0xFF
+                builder.append('%')
+                val hex = b.toString(16).uppercase()
+                if (hex.length == 1) builder.append('0')
+                builder.append(hex)
+            }
+        }
+    }
+    return builder.toString()
+}
+
+private fun buildNwcUriString(
+    walletPublicKeyHex: String,
+    relays: List<String>,
+    secretKeyHex: String,
+    lud16: String?
+): String {
+    require(relays.isNotEmpty()) { "Nostr Wallet Connect URI must include at least one relay" }
+    val queryParts = mutableListOf<String>()
+    relays.forEach { relay ->
+        queryParts += "relay=${encodeComponent(relay)}"
+    }
+    queryParts += "secret=${encodeComponent(secretKeyHex)}"
+    if (lud16 != null) {
+        queryParts += "lud16=${encodeComponent(lud16)}"
+    }
+    val query = queryParts.joinToString("&")
+    return buildString {
+        append("nostr+walletconnect://")
+        append(walletPublicKeyHex.lowercase())
+        append('?')
+        append(query)
+    }
+}
+
+private fun normalizeRelays(relays: List<String>): List<String> =
+    relays.map { it.trim() }.filter { it.isNotEmpty() }
