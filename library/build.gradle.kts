@@ -32,12 +32,12 @@ kotlin {
         val commonMain by getting {
             dependencies {
                 implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
-                implementation(project(":nostr-core"))
-                implementation(project(":nostr-codec-kotlinx-serialization"))
-                implementation(project(":nostr-runtime-coroutines"))
-                implementation(project(":nostr-transport-ktor"))
-                implementation(project(":nostr-crypto"))
-                implementation(project(":nips:nip44"))
+                implementation("io.github.nicolals:nostr-core:0.1.0-SNAPSHOT")
+                implementation("io.github.nicolals:nostr-codec-kotlinx-serialization:0.1.0-SNAPSHOT")
+                implementation("io.github.nicolals:nostr-runtime-coroutines:0.1.0-SNAPSHOT")
+                implementation("io.github.nicolals:nostr-transport-ktor:0.1.0-SNAPSHOT")
+                implementation("io.github.nicolals:nostr-crypto:0.1.0-SNAPSHOT")
+                implementation("io.github.nicolals:nip44:0.1.0-SNAPSHOT")
                 implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
                 implementation("io.ktor:ktor-client-core:2.3.12")
                 implementation("io.ktor:ktor-client-websockets:2.3.12")
