@@ -434,17 +434,17 @@ class NwcClient private constructor(
     }
 
     override suspend fun multiPayKeysend(
-        payments: List<MultiKeysendItem>,
+        items: List<MultiKeysendItem>,
         timeoutMillis: Long
     ): NwcResult<Map<String, MultiResult<KeysendResult>>> =
-        runNwcCatching { multiPayKeysendInternal(payments, timeoutMillis) }
+        runNwcCatching { multiPayKeysendInternal(items, timeoutMillis) }
 
     private suspend fun multiPayKeysendInternal(
-        payments: List<MultiKeysendItem>,
+        items: List<MultiKeysendItem>,
         timeoutMillis: Long
     ): Map<String, MultiResult<KeysendResult>> {
-        require(payments.isNotEmpty()) { "multiPayKeysend requires at least one payment" }
-        val normalized = payments.map { item ->
+        require(items.isNotEmpty()) { "multiPayKeysend requires at least one payment" }
+        val normalized = items.map { item ->
             val id = item.id ?: randomId()
             NormalizedKeysendItem(
                 id = id,
