@@ -10,11 +10,6 @@ import io.github.nostr.nwc.internal.TAG_E
 import io.github.nostr.nwc.internal.TAG_ENCRYPTION
 import io.github.nostr.nwc.internal.TAG_EXPIRATION
 import io.github.nostr.nwc.internal.TAG_P
-import io.github.nostr.nwc.internal.json
-import io.github.nostr.nwc.internal.jsonArrayOrNull
-import io.github.nostr.nwc.internal.jsonObjectOrNull
-import io.github.nostr.nwc.internal.longValueOrNull
-import io.github.nostr.nwc.internal.string
 import io.github.nostr.nwc.internal.asString
 import io.github.nostr.nwc.model.BalanceResult
 import io.github.nostr.nwc.model.BitcoinAmount
@@ -43,7 +38,6 @@ import io.ktor.client.HttpClient
 import io.ktor.client.plugins.websocket.WebSockets
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -73,8 +67,6 @@ import nostr.core.model.Filter
 import nostr.core.model.SubscriptionId
 import nostr.core.session.RelaySessionOutput
 import nostr.core.session.RelaySessionSettings
-import nostr.runtime.coroutines.CoroutineNostrRuntime
-import nostr.transport.ktor.KtorRelayConnectionFactory
 import nostr.crypto.Identity as SecpIdentity
 import calculateConversationKey as nip44CalculateConversationKey
 import decrypt as nip44Decrypt
@@ -82,6 +74,12 @@ import ensureSodium as nip44EnsureSodium
 import encrypt as nip44Encrypt
 import kotlin.random.Random
 import nostr.core.utils.toHexLower
+import io.github.nostr.nwc.internal.NwcSessionRuntime
+import io.github.nostr.nwc.internal.json
+import io.github.nostr.nwc.internal.jsonArrayOrNull
+import io.github.nostr.nwc.internal.jsonObjectOrNull
+import io.github.nostr.nwc.internal.longValueOrNull
+import io.github.nostr.nwc.internal.string
 
 private const val SUBSCRIPTION_RESPONSES = "nwc-responses"
 private const val SUBSCRIPTION_NOTIFICATIONS = "nwc-notifications"
@@ -143,12 +141,6 @@ class NwcClient private constructor(
         }
     }
 
-    private data class RelaySession(
-        val url: String,
-        val runtime: CoroutineNostrRuntime,
-        val outputsJob: Job
-    )
-
     private sealed interface PendingRequest {
         class Single(
             val method: String,
@@ -168,7 +160,12 @@ class NwcClient private constructor(
     private val walletPublicKeyHex: String = credentials.walletPublicKey.toString()
     private val conversationKey: UByteArray
 
-    private val sessions = mutableListOf<RelaySession>()
+    private val sessionRuntime = NwcSessionRuntime(
+        scope = scope,
+        httpClient = httpClient,
+        wireCodec = wireCodec,
+        sessionSettings = sessionSettings
+    )
 
     private val pendingMutex = Mutex()
     private val pendingRequests = mutableMapOf<String, PendingRequest>()
@@ -216,18 +213,14 @@ class NwcClient private constructor(
             infoSubscriptions.values.forEach { it.cancel() }
             infoSubscriptions.clear()
         }
-        sessions.forEach { session ->
-            runCatching { session.runtime.shutdown() }
-            session.outputsJob.cancel()
-        }
-        sessions.clear()
+        sessionRuntime.shutdown()
         if (ownsHttpClient) {
             runCatching { httpClient.close() }
         }
     }
 
     suspend fun refreshWalletMetadata(timeoutMillis: Long = requestTimeoutMillis): WalletMetadata {
-        sessions.forEach { session ->
+        sessionRuntime.sessionHandles.forEach { session ->
             val metadata = fetchMetadataFrom(session, timeoutMillis)
             if (metadata != null) {
                 walletMetadataState.value = metadata
@@ -490,28 +483,20 @@ class NwcClient private constructor(
     private suspend fun initialize() {
         val distinctRelays = credentials.relays.distinct()
         require(distinctRelays.isNotEmpty()) { "No relays provided in credentials" }
-        distinctRelays.forEach { relay ->
-            val runtime = CoroutineNostrRuntime(
-                scope = scope,
-                connectionFactory = KtorRelayConnectionFactory(scope, httpClient),
-                wireEncoder = wireCodec,
-                wireDecoder = wireCodec,
-                settings = sessionSettings
-            )
-            val job = scope.launch {
-                runtime.outputs.collect { output ->
-                    handleOutput(relay, output)
-                }
-            }
-            runtime.connect(relay)
+        sessionRuntime.start(
+            relays = distinctRelays,
+            handleOutput = ::handleOutput
+        ) { runtime, _ ->
             runtime.subscribe(SUBSCRIPTION_RESPONSES, listOf(responseFilter))
             runtime.subscribe(SUBSCRIPTION_NOTIFICATIONS, listOf(notificationFilter))
-            sessions += RelaySession(relay, runtime, job)
         }
         refreshWalletMetadata()
     }
 
-    private suspend fun fetchMetadataFrom(session: RelaySession, timeoutMillis: Long): WalletMetadata? {
+    private suspend fun fetchMetadataFrom(
+        session: NwcSessionRuntime.SessionHandle,
+        timeoutMillis: Long
+    ): WalletMetadata? {
         val subscriptionId = "nwc-info-${randomId()}"
         val deferred = CompletableDeferred<Event?>()
         infoMutex.withLock { infoSubscriptions[subscriptionId] = deferred }
@@ -626,19 +611,7 @@ class NwcClient private constructor(
     }
 
     private suspend fun publish(event: Event) {
-        var successful = false
-        var failure: Throwable? = null
-        sessions.forEach { session ->
-            val result = runCatching { session.runtime.publish(event) }
-            if (result.isSuccess) {
-                successful = true
-            } else {
-                failure = result.exceptionOrNull()
-            }
-        }
-        if (!successful) {
-            throw failure ?: IllegalStateException("Failed to publish event ${event.id}")
-        }
+        sessionRuntime.publish(event)
     }
 
     private fun buildRequestEvent(
