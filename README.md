@@ -93,3 +93,21 @@ Both utilities live under `io.github.nostr.nwc.testing` and are available on all
 ## Error Handling
 
 All public APIs return `NwcResult`, exposing rich failure data without throwing. `NwcFailure.Network` now surfaces the upstream `ConnectionFailureReason`, websocket close code/reason, and the original cause string published by the runtime so callers can distinguish connection factory errors from relay handshake issues without parsing log messages.
+
+## Publishing
+
+### Publish to Maven Local
+
+1. Ensure the upstream `nostr-kmp` snapshot you depend on is already available in `~/.m2` (see its project docs for publishing instructions).
+2. From this repository root run:
+   ```bash
+   ./gradlew :nwc-kmp:publishToMavenLocal
+   ```
+   This produces `io.github.nostr:nwc-kmp:<version>` in `~/.m2/repository`.
+3. Downstream projects can then depend on `implementation("io.github.nostr:nwc-kmp:<version>")` while developing locally.
+
+### Bumping the Version
+
+- Edit `gradle.properties` and update the `VERSION_NAME` property. The file also carries the `GROUP`, `POM_ARTIFACT_ID`, and other publishing metadata used during publication.
+- Follow semantic versioning. Use `-SNAPSHOT` while iterating; drop the suffix when cutting a real release.
+- After adjusting the version, re-run `./gradlew :nwc-kmp:publishToMavenLocal` so Maven consumers pick up the new artifact.

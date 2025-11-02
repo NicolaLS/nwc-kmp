@@ -19,4 +19,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "nwc-kmp"
-include(":library")
+include(":nwc-kmp")

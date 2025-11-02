@@ -7,8 +7,9 @@ plugins {
     alias(libs.plugins.vanniktech.mavenPublish)
 }
 
-group = "io.github.kotlin"
-version = "1.0.0"
+group = property("GROUP") as String
+version = property("VERSION_NAME") as String
+
 
 kotlin {
     jvmToolchain(21)
@@ -72,7 +73,7 @@ kotlin {
 }
 
 android {
-    namespace = "org.jetbrains.kotlinx.multiplatform.library.template"
+    namespace = "io.github.nostr.nwc"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
     defaultConfig {
         minSdk = libs.versions.android.minSdk.get().toInt()
@@ -88,31 +89,30 @@ mavenPublishing {
 
     signAllPublications()
 
-    coordinates(group.toString(), "library", version.toString())
-
     pom {
-        name = "My library"
-        description = "A library."
-        inceptionYear = "2024"
-        url = "https://github.com/kotlin/multiplatform-library-template/"
+        name = property("POM_NAME") as String
+        description = property("POM_DESCRIPTION") as String
+        inceptionYear = "2025"
+        url = property("POM_URL") as String
         licenses {
             license {
-                name = "XXX"
-                url = "YYY"
-                distribution = "ZZZ"
+                name = property("POM_LICENSE_NAME") as String
+                url = property("POM_LICENSE_URL") as String
+                distribution = property("POM_LICENSE_DIST") as String
             }
         }
         developers {
             developer {
-                id = "XXX"
-                name = "YYY"
-                url = "ZZZ"
+                id = property("POM_DEVELOPER_ID") as String
+                name = property("POM_DEVELOPER_NAME") as String
+                url = property("POM_DEVELOPER_URL") as String
             }
         }
         scm {
-            url = "XXX"
-            connection = "YYY"
-            developerConnection = "ZZZ"
+            val repoUrl = property("POM_URL") as String
+            url = repoUrl
+            connection = "scm:git:$repoUrl.git"
+            developerConnection = "scm:git:$repoUrl.git"
         }
     }
 }
