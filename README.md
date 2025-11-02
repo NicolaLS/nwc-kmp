@@ -53,3 +53,39 @@ val descriptorResult = discoverWallet(session)
 ```
 
 The `NwcWalletDescriptor` combines the latest wallet metadata and `get_info` response with typed capability and notification sets so you can reason about features without string matching.
+
+## End-to-End Flow
+
+```kotlin
+import io.github.nostr.nwc.NwcClient
+import io.github.nostr.nwc.NwcClientContract
+import io.github.nostr.nwc.model.NwcResult
+import io.github.nostr.nwc.model.PayInvoiceParams
+import kotlinx.coroutines.CoroutineScope
+
+class WalletRepository(private val clientFactory: suspend (CoroutineScope) -> NwcClientContract) {
+    suspend fun payInvoice(scope: CoroutineScope, invoice: String) {
+        val client = clientFactory(scope)
+        try {
+            when (val result = client.payInvoice(PayInvoiceParams(invoice))) {
+                is NwcResult.Success -> println("Paid invoice: ${result.value.preimage}")
+                is NwcResult.Failure -> println("Payment failed: ${result.failure}")
+            }
+        } finally {
+            client.close()
+        }
+    }
+}
+
+suspend fun realClientFactory(scope: CoroutineScope): NwcClientContract =
+    NwcClient.create("nostr+walletconnect://<wallet-pubkey>?relay=wss://<relay>&secret=<hex>", scope)
+```
+
+Consumers depend only on `NwcClientContract`, making it easy to inject either the real client or the new fakes in tests.
+
+## Testing Utilities
+
+- `FakeNwcClient` implements `NwcClientContract` and records each request, letting consumers drive their own success or failure scenarios without spinning up relays.
+- `ScriptedWalletHarness` responds to `pay_invoice`, `make_invoice`, and `list_transactions` commands using a deterministic ledger and optional scripts so integration tests can exercise the full flow.
+
+Both utilities live under `io.github.nostr.nwc.testing` and are available on all common Kotlin Multiplatform targets.
