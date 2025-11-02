@@ -15,9 +15,10 @@ import kotlinx.coroutines.launch
 import nostr.codec.kotlinx.serialization.KotlinxSerializationWireCodec
 import nostr.core.model.Event
 import nostr.core.session.RelaySessionOutput
-import nostr.runtime.coroutines.CoroutineNostrRuntime
-import nostr.transport.ktor.KtorRelayConnectionFactory
 import nostr.core.session.RelaySessionSettings
+import nostr.runtime.coroutines.CoroutineNostrRuntime
+import nostr.runtime.coroutines.RelaySessionManager
+import nostr.transport.ktor.KtorRelayConnectionFactory
 
 internal class NwcSessionRuntime(
     private val scope: CoroutineScope,
@@ -29,73 +30,79 @@ internal class NwcSessionRuntime(
 
     internal data class SessionHandle internal constructor(
         val url: String,
-        val runtime: CoroutineNostrRuntime
+        internal val session: RelaySessionManager.ManagedRelaySession
     )
 
     private data class RelaySession(
         val url: String,
-        val runtime: CoroutineNostrRuntime,
-        val outputsJob: Job
+        val session: RelaySessionManager.ManagedRelaySession,
+        val outputsJob: Job,
+        val snapshotsJob: Job
     ) {
-        val handle = SessionHandle(url, runtime)
+        val handle = SessionHandle(url, session)
     }
 
-    private val sessions = mutableListOf<RelaySession>()
+    private val sessionManager = RelaySessionManager(
+        scope = scope,
+        connectionFactory = KtorRelayConnectionFactory(scope, httpClient),
+        wireEncoder = wireCodec,
+        wireDecoder = wireCodec,
+        sessionSettings = sessionSettings
+    )
+    private val sessions = mutableMapOf<String, RelaySession>()
     private val relayStates = MutableStateFlow<Map<String, RelayConnectionStatus>>(emptyMap())
     private val reconnectJobs = mutableMapOf<String, Job>()
     private var shuttingDown = false
 
     val sessionHandles: List<SessionHandle>
-        get() = sessions.map { it.handle }
+        get() = sessions.values.map { it.handle }
 
     val connectionStates = relayStates.asStateFlow()
 
     suspend fun start(
         relays: List<String>,
         handleOutput: suspend (String, RelaySessionOutput) -> Unit,
-        configure: suspend (CoroutineNostrRuntime, String) -> Unit
+        configure: suspend (RelaySessionManager.ManagedRelaySession, String) -> Unit
     ) {
         if (sessions.isNotEmpty()) {
             throw IllegalStateException("NWC session runtime already started")
         }
         relays.distinct().forEach { relay ->
             updateRelayState(relay, RelayConnectionStatus.CONNECTING)
-            val runtime = CoroutineNostrRuntime(
-                scope = scope,
-                connectionFactory = KtorRelayConnectionFactory(scope, httpClient),
-                wireEncoder = wireCodec,
-                wireDecoder = wireCodec,
-                settings = sessionSettings
-            )
-            val job = scope.launch {
-                runtime.outputs.collect { output ->
-                    if (output is RelaySessionOutput.ConnectionStateChanged) {
-                        updateRelayState(relay, output.snapshot.toRelayStatus())
-                        if (retryPolicy.enabled) {
-                            scheduleReconnectIfNeeded(relay, output.snapshot)
-                        }
-                    }
+            val managed = sessionManager.acquire(relay)
+            val outputsJob = scope.launch {
+                managed.outputs.collect { output ->
                     handleOutput(relay, output)
                 }
             }
+            val snapshotsJob = scope.launch {
+                managed.connectionSnapshots.collect { snapshot ->
+                    updateRelayState(relay, snapshot.toRelayStatus())
+                    if (retryPolicy.enabled) {
+                        scheduleReconnectIfNeeded(relay, snapshot)
+                    }
+                }
+            }
             val started = kotlin.runCatching {
-                runtime.connect(relay)
-                configure(runtime, relay)
+                managed.connect()
+                configure(managed, relay)
             }
             if (started.isFailure) {
-                job.cancel()
-                kotlin.runCatching { runtime.shutdown() }
+                snapshotsJob.cancel()
+                outputsJob.cancel()
+                reconnectJobs.remove(relay)?.cancel()
+                managed.release()
                 throw started.exceptionOrNull()!!
             }
-            sessions += RelaySession(relay, runtime, job)
+            sessions[relay] = RelaySession(relay, managed, outputsJob, snapshotsJob)
         }
     }
 
     suspend fun publish(event: Event) {
         var successful = false
         var failure: Throwable? = null
-        sessions.forEach { session ->
-            val result = runCatching { session.runtime.publish(event) }
+        sessions.values.forEach { session ->
+            val result = runCatching { session.session.publish(event) }
             if (result.isSuccess) {
                 successful = true
             } else {
@@ -111,11 +118,14 @@ internal class NwcSessionRuntime(
         shuttingDown = true
         reconnectJobs.values.forEach { it.cancel() }
         reconnectJobs.clear()
-        sessions.forEach { session ->
-            session.outputsJob.cancelAndJoin()
-            runCatching { session.runtime.shutdown() }
-        }
+        val current = sessions.values.toList()
         sessions.clear()
+        current.forEach { session ->
+            session.outputsJob.cancelAndJoin()
+            session.snapshotsJob.cancelAndJoin()
+            runCatching { session.session.release() }
+        }
+        sessionManager.shutdown()
         relayStates.value = emptyMap()
     }
 
@@ -134,10 +144,10 @@ internal class NwcSessionRuntime(
         }
         if (!shouldReconnect) return
         if (reconnectJobs[relay]?.isActive == true) return
-        val session = sessions.firstOrNull { it.url == relay } ?: return
+        val session = sessions[relay] ?: return
         reconnectJobs[relay] = scope.launch {
             delay(retryPolicy.reconnectDelayMillis)
-            kotlin.runCatching { session.runtime.connect(relay) }
+            kotlin.runCatching { session.session.connect() }
         }
     }
 

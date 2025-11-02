@@ -591,9 +591,9 @@ class NwcClient private constructor(
 
     private suspend fun initialize() {
         require(credentials.relays.isNotEmpty()) { "No relays provided in credentials" }
-        session.open(handleOutput = ::handleOutput) { runtime, _ ->
-            runtime.subscribe(SUBSCRIPTION_RESPONSES, listOf(responseFilter))
-            runtime.subscribe(SUBSCRIPTION_NOTIFICATIONS, listOf(notificationFilter))
+        session.open(handleOutput = ::handleOutput) { relaySession, _ ->
+            relaySession.subscribe(SUBSCRIPTION_RESPONSES, listOf(responseFilter))
+            relaySession.subscribe(SUBSCRIPTION_NOTIFICATIONS, listOf(notificationFilter))
         }
         refreshWalletMetadataInternal(requestTimeoutMillis)
     }
@@ -610,14 +610,14 @@ class NwcClient private constructor(
             authors = setOf(walletPublicKeyHex),
             limit = 1
         )
-        session.runtime.subscribe(subscriptionId, listOf(filter))
+        session.session.subscribe(subscriptionId, listOf(filter))
         val resultEvent = try {
             withTimeout(timeoutMillis) { deferred.await() }
         } catch (_: TimeoutCancellationException) {
             null
         } finally {
             infoMutex.withLock { infoSubscriptions.remove(subscriptionId) }
-            session.runtime.unsubscribe(subscriptionId)
+            session.session.unsubscribe(subscriptionId)
         }
         return resultEvent?.let { parseWalletMetadata(it) }
     }
