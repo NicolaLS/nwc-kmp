@@ -1,22 +1,26 @@
-[![official project](http://jb.gg/badges/official.svg)](https://github.com/JetBrains#jetbrains-on-github)
+# Nostr Wallet Connect KMP
 
-# Multiplatform library template
+Kotlin Multiplatform client for [Nostr Wallet Connect (NIP-47)](https://github.com/nostr-protocol/nips/blob/master/47.md). The library exposes session management, typed requests, wallet discovery, and structured error handling for JVM, Android, iOS, and other Kotlin targets.
 
-## What is it?
+## Features
 
-This repository contains a simple library project, intended to demonstrate a [Kotlin Multiplatform](https://kotlinlang.org/docs/multiplatform.html) library that is deployable to [Maven Central](https://central.sonatype.com/).
+- Immutable credential and session APIs (`NwcUri`, `NwcSession`, `NwcSessionManager`).
+- `NwcClientContract` interface with production implementation and test fakes.
+- Wallet discovery helpers returning typed capabilities and metadata.
+- Structured `NwcFailure` taxonomy with detailed diagnostics for connection issues.
+- Streaming connection state and wallet metadata updates via `StateFlow`.
 
-The library has only one function: generate the [Fibonacci sequence](https://en.wikipedia.org/wiki/Fibonacci_sequence) starting from platform-provided numbers. Also, it has a test for each platform just to be sure that tests run.
+## Modules
 
-Note that no other actions or tools usually required for the library development are set up, such as [tracking of backwards compatibility](https://kotlinlang.org/docs/jvm-api-guidelines-backward-compatibility.html#tools-designed-to-enforce-backward-compatibility), explicit API mode, licensing, contribution guideline, code of conduct and others. You can find a guide for best practices for designing Kotlin libraries [here](https://kotlinlang.org/docs/api-guidelines-introduction.html).
+- `nwc-kmp`: multiplatform runtime delivering the Nostr Wallet Connect client.
 
-## Guide
+## Adding the Dependency
 
-Please find the detailed guide [here](https://www.jetbrains.com/help/kotlin-multiplatform-dev/multiplatform-publish-libraries.html).
-
-# Other resources
-* [Publishing via the Central Portal](https://central.sonatype.org/publish-ea/publish-ea-guide/)
-* [Gradle Maven Publish Plugin \- Publishing to Maven Central](https://vanniktech.github.io/gradle-maven-publish-plugin/central/)
+```kotlin
+dependencies {
+    implementation("io.github.nostr:nwc-kmp:0.1.0-SNAPSHOT")
+}
+```
 
 
 ## Quickstart: Wallet Discovery
