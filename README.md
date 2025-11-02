@@ -18,7 +18,7 @@ Kotlin Multiplatform client for [Nostr Wallet Connect (NIP-47)](https://github.c
 
 ```kotlin
 dependencies {
-    implementation("io.github.nostr:nwc-kmp:0.1.0-SNAPSHOT")
+    implementation("io.github.nicolals:nwc-kmp:0.1.0-SNAPSHOT")
 }
 ```
 
@@ -107,8 +107,8 @@ All public APIs return `NwcResult`, exposing rich failure data without throwing.
    ```bash
    ./gradlew :nwc-kmp:publishToMavenLocal
    ```
-   This produces `io.github.nostr:nwc-kmp:<version>` in `~/.m2/repository`.
-3. Downstream projects can then depend on `implementation("io.github.nostr:nwc-kmp:<version>")` while developing locally.
+   This produces `io.github.nicolals:nwc-kmp:<version>` in `~/.m2/repository`.
+3. Downstream projects can then depend on `implementation("io.github.nicolals:nwc-kmp:<version>")` while developing locally.
 
 ### Bumping the Version
 
