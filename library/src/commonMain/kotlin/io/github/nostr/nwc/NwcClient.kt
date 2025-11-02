@@ -99,8 +99,11 @@ class NwcClient private constructor(
     private val session: NwcSession,
     private val ownsSession: Boolean,
     private val httpClient: HttpClient,
-    private val ownsHttpClient: Boolean
+    private val ownsHttpClient: Boolean,
+    private val interceptors: List<NwcClientInterceptor>
 ) {
+
+    private val hasInterceptors = interceptors.isNotEmpty()
 
     companion object {
         suspend fun create(
@@ -124,7 +127,8 @@ class NwcClient private constructor(
             scope: CoroutineScope,
             httpClient: HttpClient? = null,
             sessionSettings: RelaySessionSettings = RelaySessionSettings(),
-            requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS
+            requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS,
+            interceptors: List<NwcClientInterceptor> = emptyList()
         ): NwcClient {
             val credentials = uri.toCredentials()
             val (client, ownsClient) = httpClient?.let { it to false } ?: run {
@@ -136,7 +140,7 @@ class NwcClient private constructor(
                 httpClient = client,
                 sessionSettings = sessionSettings
             )
-            return create(credentials, scope, session, ownsSession = true, httpClient = client, ownsHttpClient = ownsClient, requestTimeoutMillis = requestTimeoutMillis)
+            return create(credentials, scope, session, ownsSession = true, httpClient = client, ownsHttpClient = ownsClient, requestTimeoutMillis = requestTimeoutMillis, interceptors = interceptors)
         }
 
         suspend fun create(
@@ -144,7 +148,8 @@ class NwcClient private constructor(
             scope: CoroutineScope,
             httpClient: HttpClient? = null,
             sessionSettings: RelaySessionSettings = RelaySessionSettings(),
-            requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS
+            requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS,
+            interceptors: List<NwcClientInterceptor> = emptyList()
         ): NwcClient {
             val (client, ownsClient) = httpClient?.let { it to false } ?: run {
                 defaultNwcHttpClient() to true
@@ -155,7 +160,7 @@ class NwcClient private constructor(
                 httpClient = client,
                 sessionSettings = sessionSettings
             )
-            return create(credentials, scope, session, ownsSession = true, httpClient = client, ownsHttpClient = ownsClient, requestTimeoutMillis = requestTimeoutMillis)
+            return create(credentials, scope, session, ownsSession = true, httpClient = client, ownsHttpClient = ownsClient, requestTimeoutMillis = requestTimeoutMillis, interceptors = interceptors)
         }
 
         suspend fun create(
@@ -165,7 +170,8 @@ class NwcClient private constructor(
             ownsSession: Boolean,
             httpClient: HttpClient,
             ownsHttpClient: Boolean = false,
-            requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS
+            requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS,
+            interceptors: List<NwcClientInterceptor> = emptyList()
         ): NwcClient {
             val client = NwcClient(
                 credentials = credentials,
@@ -174,7 +180,8 @@ class NwcClient private constructor(
                 session = session,
                 ownsSession = ownsSession,
                 httpClient = httpClient,
-                ownsHttpClient = ownsHttpClient
+                ownsHttpClient = ownsHttpClient,
+                interceptors = interceptors
             )
             client.initialize()
             return client
@@ -628,6 +635,9 @@ class NwcClient private constructor(
         timeoutMillis: Long,
         expirationSeconds: Long? = null
     ): RawResponse {
+        if (hasInterceptors) {
+            interceptors.forEach { it.onRequest(method, params) }
+        }
         val event = buildRequestEvent(method, params, expirationSeconds)
         val deferred = CompletableDeferred<RawResponse>()
         registerPending(event.id, PendingRequest.Single(method, deferred))
@@ -639,6 +649,9 @@ class NwcClient private constructor(
         }
         val response = awaitSingleResponse(method, event.id, deferred, timeoutMillis)
         response.error?.let { throw NwcRequestException(it) }
+        if (hasInterceptors) {
+            interceptors.forEach { it.onResponse(method, response) }
+        }
         return response
     }
 
@@ -650,6 +663,9 @@ class NwcClient private constructor(
         expirationSeconds: Long? = null
     ): Map<String, RawResponse> {
         require(expectedKeys.isNotEmpty()) { "Multi request expected keys cannot be empty" }
+        if (hasInterceptors) {
+            interceptors.forEach { it.onRequest(method, params) }
+        }
         val event = buildRequestEvent(method, params, expirationSeconds)
         val deferred = CompletableDeferred<Map<String, RawResponse>>()
         registerPending(
@@ -667,13 +683,19 @@ class NwcClient private constructor(
             removePending(event.id, deferred)
             throw NwcException("Failed to publish multi request $method", failure)
         }
-        return try {
+        val responses = try {
             withTimeout(timeoutMillis) { deferred.await() }
         } catch (timeout: TimeoutCancellationException) {
             throw NwcTimeoutException("Timed out waiting for $method responses", timeout)
         } finally {
             pendingMutex.withLock { pendingRequests.remove(event.id) }
         }
+        if (hasInterceptors) {
+            responses.forEach { (_, response) ->
+                interceptors.forEach { it.onResponse(method, response) }
+            }
+        }
+        return responses
     }
 
     private suspend fun awaitSingleResponse(
@@ -862,6 +884,9 @@ class NwcClient private constructor(
             NotificationTypes.PAYMENT_SENT -> WalletNotification.PaymentSent(transaction)
             else -> null
         } ?: return
+        if (hasInterceptors) {
+            interceptors.forEach { it.onNotification(notification) }
+        }
         if (!_notifications.tryEmit(notification)) {
             scope.launch { _notifications.emit(notification) }
         }

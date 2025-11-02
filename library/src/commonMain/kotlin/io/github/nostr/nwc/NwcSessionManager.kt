@@ -17,7 +17,8 @@ class NwcSessionManager private constructor(
     private val ownsScope: Boolean,
     private val httpClient: HttpClient,
     private val ownsHttpClient: Boolean,
-    private val sessionSettings: RelaySessionSettings
+    private val sessionSettings: RelaySessionSettings,
+    private val retryPolicy: NwcRetryPolicy
 ) {
 
     private val mutex = Mutex()
@@ -54,7 +55,8 @@ class NwcSessionManager private constructor(
                 credentials = credentials,
                 scope = scope,
                 httpClient = httpClient,
-                sessionSettings = sessionSettings
+                sessionSettings = sessionSettings,
+                retryPolicy = retryPolicy
             )
             sessions[key] = ManagedSession(created, 1)
             created to true
@@ -113,7 +115,8 @@ class NwcSessionManager private constructor(
         fun create(
             scope: CoroutineScope? = null,
             httpClient: HttpClient? = null,
-            sessionSettings: RelaySessionSettings = RelaySessionSettings()
+            sessionSettings: RelaySessionSettings = RelaySessionSettings(),
+            retryPolicy: NwcRetryPolicy = NwcRetryPolicy.Default
         ): NwcSessionManager {
             val managedScope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
             val ownsScope = scope == null
@@ -125,7 +128,8 @@ class NwcSessionManager private constructor(
                 ownsScope = ownsScope,
                 httpClient = client,
                 ownsHttpClient = ownsClient,
-                sessionSettings = sessionSettings
+                sessionSettings = sessionSettings,
+                retryPolicy = retryPolicy
             )
         }
     }

@@ -2,17 +2,24 @@ package io.github.nostr.nwc
 
 import io.github.nostr.nwc.internal.NwcSessionRuntime
 import io.github.nostr.nwc.internal.defaultNwcHttpClient
+import io.github.nostr.nwc.model.NwcConnectionState
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import nostr.codec.kotlinx.serialization.KotlinxSerializationWireCodec
 import nostr.core.session.RelaySessionOutput
 import nostr.core.session.RelaySessionSettings
 import nostr.runtime.coroutines.CoroutineNostrRuntime
+import io.github.nostr.nwc.model.NwcConnectionState
+import io.github.nostr.nwc.model.RelayConnectionStatus
 
 class NwcSession private constructor(
     val credentials: NwcCredentials,
@@ -21,6 +28,7 @@ class NwcSession private constructor(
     private val httpClient: HttpClient,
     private val ownsHttpClient: Boolean,
     private val sessionSettings: RelaySessionSettings,
+    private val retryPolicy: NwcRetryPolicy,
     private val wireCodec: KotlinxSerializationWireCodec
 ) {
 
@@ -28,11 +36,16 @@ class NwcSession private constructor(
         scope = scope,
         httpClient = httpClient,
         wireCodec = wireCodec,
-        sessionSettings = sessionSettings
+        sessionSettings = sessionSettings,
+        retryPolicy = retryPolicy
     )
 
     private val lifecycleMutex = Mutex()
     private var lifecycle: Lifecycle = Lifecycle.Idle
+    private var stateJob: kotlinx.coroutines.Job? = null
+
+    private val _connectionState = MutableStateFlow(NwcConnectionState.Empty)
+    val connectionState: StateFlow<NwcConnectionState> = _connectionState.asStateFlow()
 
     val relays: List<String> get() = credentials.relays
 
@@ -54,6 +67,12 @@ class NwcSession private constructor(
                 configure = configure
             )
             lifecycle = Lifecycle.Open
+            stateJob?.cancel()
+            stateJob = scope.launch {
+                runtime.connectionStates.collect { states ->
+                    _connectionState.value = NwcConnectionState.fromRelayStates(states)
+                }
+            }
         }
     }
 
@@ -64,7 +83,10 @@ class NwcSession private constructor(
             true
         }
         if (shouldShutdown) {
+            stateJob?.cancel()
+            stateJob = null
             runtime.shutdown()
+            _connectionState.value = NwcConnectionState.Empty
             if (ownsHttpClient) {
                 runCatching { httpClient.close() }
             }
@@ -91,6 +113,7 @@ class NwcSession private constructor(
     internal val coroutineScope: CoroutineScope get() = scope
     internal val httpClientInternal: HttpClient get() = httpClient
     internal val ownsHttpClientInternal: Boolean get() = ownsHttpClient
+    internal val retryPolicyInternal: NwcRetryPolicy get() = retryPolicy
 
     private enum class Lifecycle {
         Idle,
@@ -103,21 +126,24 @@ class NwcSession private constructor(
             uri: String,
             scope: CoroutineScope? = null,
             httpClient: HttpClient? = null,
-            sessionSettings: RelaySessionSettings = RelaySessionSettings()
-        ): NwcSession = create(NwcUri.parse(uri), scope, httpClient, sessionSettings)
+            sessionSettings: RelaySessionSettings = RelaySessionSettings(),
+            retryPolicy: NwcRetryPolicy = NwcRetryPolicy.Default
+        ): NwcSession = create(NwcUri.parse(uri), scope, httpClient, sessionSettings, retryPolicy)
 
         fun create(
             uri: NwcUri,
             scope: CoroutineScope? = null,
             httpClient: HttpClient? = null,
-            sessionSettings: RelaySessionSettings = RelaySessionSettings()
-        ): NwcSession = create(uri.toCredentials(), scope, httpClient, sessionSettings)
+            sessionSettings: RelaySessionSettings = RelaySessionSettings(),
+            retryPolicy: NwcRetryPolicy = NwcRetryPolicy.Default
+        ): NwcSession = create(uri.toCredentials(), scope, httpClient, sessionSettings, retryPolicy)
 
         fun create(
             credentials: NwcCredentials,
             scope: CoroutineScope? = null,
             httpClient: HttpClient? = null,
-            sessionSettings: RelaySessionSettings = RelaySessionSettings()
+            sessionSettings: RelaySessionSettings = RelaySessionSettings(),
+            retryPolicy: NwcRetryPolicy = NwcRetryPolicy.Default
         ): NwcSession {
             val managedScope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
             val ownsScope = scope == null
@@ -132,6 +158,7 @@ class NwcSession private constructor(
                 httpClient = client,
                 ownsHttpClient = ownsClient,
                 sessionSettings = sessionSettings,
+                retryPolicy = retryPolicy,
                 wireCodec = codec
             )
         }
