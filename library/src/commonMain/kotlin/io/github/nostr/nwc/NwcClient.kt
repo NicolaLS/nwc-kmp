@@ -27,6 +27,8 @@ import io.github.nostr.nwc.model.MultiPayInvoiceItem
 import io.github.nostr.nwc.model.MultiResult
 import io.github.nostr.nwc.model.Network
 import io.github.nostr.nwc.model.NwcError
+import io.github.nostr.nwc.model.NwcCapability
+import io.github.nostr.nwc.model.NwcNotificationType
 import io.github.nostr.nwc.model.PayInvoiceParams
 import io.github.nostr.nwc.model.PayInvoiceResult
 import io.github.nostr.nwc.model.Transaction
@@ -287,11 +289,11 @@ class NwcClient private constructor(
             ?: throw NwcProtocolException("get_info response missing pubkey")
         val network = Network.fromWire(obj.string("network"))
         val methods = obj.jsonArrayOrNull("methods")
-            ?.mapNotNull { it.asString() }
+            ?.mapNotNull { NwcCapability.fromWire(it.asString()) }
             ?.toSet()
             ?: emptySet()
         val notifications = obj.jsonArrayOrNull("notifications")
-            ?.mapNotNull { it.asString() }
+            ?.mapNotNull { NwcNotificationType.fromWire(it.asString()) }
             ?.toSet()
             ?: emptySet()
         return GetInfoResult(
@@ -823,20 +825,18 @@ class NwcClient private constructor(
     }
 
     private fun parseWalletMetadata(event: Event): WalletMetadata {
-        val capabilities = event.content
+        val capabilityValues = event.content
             .split(' ', '\n', '\t')
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .toSet()
+            .mapNotNull { it.trim().takeIf { it.isNotEmpty() } }
+        val capabilities = NwcCapability.parseAll(capabilityValues)
         val encryptionTag = event.tagValue(TAG_ENCRYPTION)
         val encryptionSchemes = EncryptionScheme.parseList(encryptionTag?.replace(',', ' '))
         val notificationsTag = event.tags.firstOrNull { it.firstOrNull() == "notifications" }
-        val notificationTypes = notificationsTag?.getOrNull(1)
+        val notificationValues = notificationsTag?.getOrNull(1)
             ?.split(' ')
-            ?.map { it.trim() }
-            ?.filter { it.isNotEmpty() }
-            ?.toSet()
-            ?: emptySet()
+            ?.mapNotNull { it.trim().takeIf { it.isNotEmpty() } }
+            ?: emptyList()
+        val notificationTypes = NwcNotificationType.parseAll(notificationValues)
         return WalletMetadata(capabilities, encryptionSchemes, notificationTypes)
     }
 

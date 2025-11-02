@@ -83,6 +83,61 @@ data class BalanceResult(
     val balance: BitcoinAmount
 )
 
+sealed class NwcCapability(val wireName: String) {
+    object PayInvoice : NwcCapability("pay_invoice")
+    object MultiPayInvoice : NwcCapability("multi_pay_invoice")
+    object PayKeysend : NwcCapability("pay_keysend")
+    object MultiPayKeysend : NwcCapability("multi_pay_keysend")
+    object MakeInvoice : NwcCapability("make_invoice")
+    object LookupInvoice : NwcCapability("lookup_invoice")
+    object ListTransactions : NwcCapability("list_transactions")
+    object GetBalance : NwcCapability("get_balance")
+    object GetInfo : NwcCapability("get_info")
+    data class Unknown(val value: String) : NwcCapability(value)
+
+    companion object {
+        private val known = listOf(
+            PayInvoice,
+            MultiPayInvoice,
+            PayKeysend,
+            MultiPayKeysend,
+            MakeInvoice,
+            LookupInvoice,
+            ListTransactions,
+            GetBalance,
+            GetInfo
+        ).associateBy { it.wireName }
+
+        fun fromWire(raw: String?): NwcCapability? {
+            if (raw.isNullOrBlank()) return null
+            val normalized = raw.trim().lowercase()
+            return known[normalized] ?: Unknown(normalized)
+        }
+
+        fun parseAll(values: Collection<String>): Set<NwcCapability> =
+            values.mapNotNull { fromWire(it) }.toSet()
+    }
+}
+
+sealed class NwcNotificationType(val wireName: String) {
+    object PaymentReceived : NwcNotificationType("payment_received")
+    object PaymentSent : NwcNotificationType("payment_sent")
+    data class Unknown(val value: String) : NwcNotificationType(value)
+
+    companion object {
+        private val known = listOf(PaymentReceived, PaymentSent).associateBy { it.wireName }
+
+        fun fromWire(raw: String?): NwcNotificationType? {
+            if (raw.isNullOrBlank()) return null
+            val normalized = raw.trim().lowercase()
+            return known[normalized] ?: Unknown(normalized)
+        }
+
+        fun parseAll(values: Collection<String>): Set<NwcNotificationType> =
+            values.mapNotNull { fromWire(it) }.toSet()
+    }
+}
+
 enum class Network {
     MAINNET,
     TESTNET,
@@ -108,34 +163,37 @@ data class GetInfoResult(
     val network: Network,
     val blockHeight: Long?,
     val blockHash: String?,
-    val methods: Set<String>,
-    val notifications: Set<String>
+    val methods: Set<NwcCapability>,
+    val notifications: Set<NwcNotificationType>
 )
 
-enum class EncryptionScheme(val wireName: String) {
-    Nip44V2("nip44_v2"),
-    Nip04("nip04");
+sealed class EncryptionScheme(val wireName: String) {
+    object Nip44V2 : EncryptionScheme("nip44_v2")
+    object Nip04 : EncryptionScheme("nip04")
+    data class Unknown(val value: String) : EncryptionScheme(value)
 
     companion object {
+        private val known = listOf(Nip44V2, Nip04).associateBy { it.wireName }
+
+        fun fromWire(raw: String?): EncryptionScheme? {
+            if (raw.isNullOrBlank()) return null
+            val normalized = raw.trim().lowercase()
+            return known[normalized] ?: Unknown(normalized)
+        }
+
         fun parseList(raw: String?): Set<EncryptionScheme> {
             if (raw.isNullOrBlank()) return emptySet()
             return raw.split(' ')
-                .mapNotNull { value ->
-                    when (value.trim()) {
-                        Nip44V2.wireName -> Nip44V2
-                        Nip04.wireName -> Nip04
-                        else -> null
-                    }
-                }
+                .mapNotNull { fromWire(it) }
                 .toSet()
         }
     }
 }
 
 data class WalletMetadata(
-    val capabilities: Set<String>,
+    val capabilities: Set<NwcCapability>,
     val encryptionSchemes: Set<EncryptionScheme>,
-    val notificationTypes: Set<String>
+    val notificationTypes: Set<NwcNotificationType>
 )
 
 sealed class WalletNotification {
