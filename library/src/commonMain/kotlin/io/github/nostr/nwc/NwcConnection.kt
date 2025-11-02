@@ -3,6 +3,21 @@ package io.github.nostr.nwc
 import nostr.core.crypto.keys.PrivateKey
 import nostr.core.crypto.keys.PublicKey
 
+internal data class ParsedNwcUri(
+    val original: String,
+    val walletPublicKey: PublicKey,
+    val relays: List<String>,
+    val secretKey: PrivateKey,
+    val lud16: String?
+) {
+    fun toCredentials(): NwcCredentials = NwcCredentials(
+        walletPublicKey = walletPublicKey,
+        relays = relays,
+        secretKey = secretKey,
+        lud16 = lud16
+    )
+}
+
 data class NwcCredentials(
     val walletPublicKey: PublicKey,
     val relays: List<String>,
@@ -15,6 +30,10 @@ data class NwcCredentials(
 }
 
 fun parseNwcUri(uri: String): NwcCredentials {
+    return parseNwcUriComponents(uri).toCredentials()
+}
+
+internal fun parseNwcUriComponents(uri: String): ParsedNwcUri {
     val trimmed = uri.trim()
     require(trimmed.isNotEmpty()) { "Nostr Wallet Connect URI cannot be empty" }
     val (scheme, remainder) = extractScheme(trimmed)
@@ -42,9 +61,10 @@ fun parseNwcUri(uri: String): NwcCredentials {
     val secret = parameters["secret"]?.firstOrNull()?.trim()
     require(!secret.isNullOrEmpty()) { "Nostr Wallet Connect URI missing required secret parameter" }
     val relayList = relays!!
-    val secretValue = secret!!
+    val secretValue = secret!!.trim()
     val lud16 = parameters["lud16"]?.firstOrNull()?.takeIf { it.isNotBlank() }
-    return NwcCredentials(
+    return ParsedNwcUri(
+        original = trimmed,
         walletPublicKey = walletPublicKey,
         relays = relayList,
         secretKey = PrivateKey.fromHex(secretValue),

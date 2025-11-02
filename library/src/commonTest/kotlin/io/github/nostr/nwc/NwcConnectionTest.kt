@@ -31,6 +31,21 @@ class NwcConnectionTest {
     }
 
     @Test
+    fun parseComponentsExposeOriginalAndFields() {
+        val original = "nostr+walletconnect://$samplePubkey?relay=wss://relay.example&secret=$sampleSecret&lud16=alice@example.com"
+        val uri = "  $original  "
+
+        val parsed = parseNwcUriComponents(uri)
+
+        assertEquals(original, parsed.original)
+        assertEquals(samplePubkey, parsed.walletPublicKey.toString())
+        assertEquals(listOf("wss://relay.example"), parsed.relays)
+        assertEquals(sampleSecret, parsed.secretKey.hex)
+        assertEquals("alice@example.com", parsed.lud16)
+        assertEquals(parsed.toCredentials(), parseNwcUri(uri))
+    }
+
+    @Test
     fun missingSecretFails() {
         val uri = "nostr+walletconnect://$samplePubkey?relay=wss://relay.example"
 
