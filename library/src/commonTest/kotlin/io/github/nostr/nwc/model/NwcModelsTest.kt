@@ -34,6 +34,7 @@ class NwcModelsTest {
 
     @Test
     fun walletDescriptorUnifiesMetadataAndInfo() {
+        val walletPubkey = "f".repeat(64)
         val metadata = WalletMetadata(
             capabilities = setOf(NwcCapability.PayInvoice),
             encryptionSchemes = setOf(EncryptionScheme.Nip44V2),
@@ -42,7 +43,7 @@ class NwcModelsTest {
         val info = GetInfoResult(
             alias = "Alice",
             color = "#ffffff",
-            pubkey = "abc",
+            pubkey = walletPubkey,
             network = Network.MAINNET,
             blockHeight = 100L,
             blockHash = "hash",
@@ -50,7 +51,10 @@ class NwcModelsTest {
             notifications = setOf(NwcNotificationType.PaymentSent)
         )
         val descriptor = NwcWalletDescriptor(
-            uri = NwcUri.parse("nostr+walletconnect://abc?relay=wss://relay.example&secret=71a8c14c1407c113601079c4302dab36460f0ccd0ad506f1f2dc73b5100e4f3c"),
+            uri = NwcUri.parse(
+                "nostr+walletconnect://$walletPubkey?relay=wss://relay.example" +
+                    "&secret=71a8c14c1407c113601079c4302dab36460f0ccd0ad506f1f2dc73b5100e4f3c"
+            ),
             metadata = metadata,
             info = info,
             negotiatedEncryption = EncryptionScheme.Nip44V2,

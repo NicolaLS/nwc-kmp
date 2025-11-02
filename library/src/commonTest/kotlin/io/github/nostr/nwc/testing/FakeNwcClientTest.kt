@@ -16,9 +16,9 @@ import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
 
@@ -78,14 +78,11 @@ class FakeNwcClientTest {
             metadata = buildJsonObject { }
         )
         val notification = WalletNotification.PaymentReceived(transaction)
-        val channel = Channel<WalletNotification>(capacity = 1)
-        val job = launch {
-            fake.notifications.collect { channel.send(it) }
-        }
+        val deferred = async { fake.notifications.first() }
+        advanceUntilIdle()
         fake.emitNotification(notification)
 
-        assertEquals(notification, channel.receive())
-        job.cancelAndJoin()
+        assertEquals(notification, deferred.await())
     }
 
     @Test

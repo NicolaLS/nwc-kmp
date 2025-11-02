@@ -12,8 +12,12 @@ class EncryptionSchemeTest {
     }
 
     @Test
-    fun parseListIgnoresUnknownEntries() {
+    fun parseListIncludesUnknownEntries() {
         val parsed = EncryptionScheme.parseList("nip44_v2 experimental")
-        assertEquals(setOf(EncryptionScheme.Nip44V2), parsed)
+        val expected = setOf(
+            EncryptionScheme.Nip44V2,
+            EncryptionScheme.Unknown("experimental")
+        )
+        assertEquals(expected, parsed)
     }
 }
