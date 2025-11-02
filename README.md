@@ -17,3 +17,33 @@ Please find the detailed guide [here](https://www.jetbrains.com/help/kotlin-mult
 # Other resources
 * [Publishing via the Central Portal](https://central.sonatype.org/publish-ea/publish-ea-guide/)
 * [Gradle Maven Publish Plugin \- Publishing to Maven Central](https://vanniktech.github.io/gradle-maven-publish-plugin/central/)
+
+
+## Quickstart: Wallet Discovery
+
+```kotlin
+import io.github.nostr.nwc.DEFAULT_REQUEST_TIMEOUT_MS
+import io.github.nostr.nwc.discoverWallet
+import io.github.nostr.nwc.model.NwcCapability
+
+suspend fun loadDescriptor(connectionUri: String) {
+    val descriptor = discoverWallet(
+        uri = connectionUri,
+        requestTimeoutMillis = DEFAULT_REQUEST_TIMEOUT_MS
+    )
+    if (NwcCapability.PayInvoice in descriptor.capabilities) {
+        println("Wallet ${'$'}{descriptor.alias} supports paying invoices on ${'$'}{descriptor.network}")
+    }
+    descriptor.notifications.forEach { println("Supports notification: ${'$'}it") }
+}
+```
+
+For long-lived integrations, reuse a shared `NwcSession`:
+
+```kotlin
+val session = NwcSession.create(connectionUri)
+val descriptor = discoverWallet(session)
+// Later reuse the same session when creating NwcClient instances
+```
+
+The `NwcWalletDescriptor` combines the latest wallet metadata and `get_info` response with typed capability and notification sets so you can reason about features without string matching.
