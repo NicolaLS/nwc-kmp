@@ -15,8 +15,10 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
 
@@ -56,6 +58,7 @@ class FakeNwcClientTest {
         )
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun notificationsEmitToCollectors() = runTest {
         val fake = FakeNwcClient()
@@ -75,16 +78,14 @@ class FakeNwcClientTest {
             metadata = buildJsonObject { }
         )
         val notification = WalletNotification.PaymentReceived(transaction)
-        val collected = mutableListOf<WalletNotification>()
+        val channel = Channel<WalletNotification>(capacity = 1)
         val job = launch {
-            fake.notifications.collect { collected += it }
+            fake.notifications.collect { channel.send(it) }
         }
-
         fake.emitNotification(notification)
-        advanceUntilIdle()
-        job.cancel()
 
-        assertEquals(listOf(notification), collected)
+        assertEquals(notification, channel.receive())
+        job.cancelAndJoin()
     }
 
     @Test

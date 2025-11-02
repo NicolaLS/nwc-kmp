@@ -2,6 +2,7 @@ package io.github.nostr.nwc
 
 import io.github.nostr.nwc.internal.NwcSessionRuntime
 import io.github.nostr.nwc.internal.defaultNwcHttpClient
+import io.github.nostr.nwc.model.NwcConnectionState
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
