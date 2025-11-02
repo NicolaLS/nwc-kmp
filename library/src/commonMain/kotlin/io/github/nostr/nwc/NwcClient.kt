@@ -60,7 +60,6 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.jsonPrimitive
 import kotlin.ExperimentalUnsignedTypes
-import nostr.codec.kotlinx.serialization.KotlinxSerializationWireCodec
 import nostr.core.identity.Identity
 import nostr.core.model.Event
 import nostr.core.model.Filter
@@ -92,9 +91,8 @@ private const val DEFAULT_TIMEOUT_MILLIS = 30_000L
 class NwcClient private constructor(
     private val credentials: NwcCredentials,
     private val scope: CoroutineScope,
-    private val sessionSettings: RelaySessionSettings,
     private val requestTimeoutMillis: Long,
-    private val wireCodec: KotlinxSerializationWireCodec,
+    private val session: NwcSession,
     private val httpClient: HttpClient,
     private val ownsHttpClient: Boolean
 ) {
@@ -124,27 +122,50 @@ class NwcClient private constructor(
             requestTimeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS
         ): NwcClient {
             val credentials = uri.toCredentials()
-            val (client, owns) = httpClient?.let { it to false } ?: run {
+            val (client, ownsClient) = httpClient?.let { it to false } ?: run {
                 defaultNwcHttpClient() to true
             }
-            return create(credentials, scope, client, owns, sessionSettings, requestTimeoutMillis)
+            val session = NwcSession.create(
+                credentials = credentials,
+                scope = scope,
+                httpClient = client,
+                sessionSettings = sessionSettings
+            )
+            return create(credentials, scope, session, client, ownsClient, requestTimeoutMillis)
         }
 
         suspend fun create(
             credentials: NwcCredentials,
             scope: CoroutineScope,
-            httpClient: HttpClient,
-            ownsHttpClient: Boolean = false,
+            httpClient: HttpClient? = null,
             sessionSettings: RelaySessionSettings = RelaySessionSettings(),
             requestTimeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS
         ): NwcClient {
-            val codec = KotlinxSerializationWireCodec.default()
+            val (client, ownsClient) = httpClient?.let { it to false } ?: run {
+                defaultNwcHttpClient() to true
+            }
+            val session = NwcSession.create(
+                credentials = credentials,
+                scope = scope,
+                httpClient = client,
+                sessionSettings = sessionSettings
+            )
+            return create(credentials, scope, session, client, ownsClient, requestTimeoutMillis)
+        }
+
+        suspend fun create(
+            credentials: NwcCredentials,
+            scope: CoroutineScope,
+            session: NwcSession,
+            httpClient: HttpClient,
+            ownsHttpClient: Boolean = false,
+            requestTimeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS
+        ): NwcClient {
             val client = NwcClient(
                 credentials = credentials,
                 scope = scope,
-                sessionSettings = sessionSettings,
                 requestTimeoutMillis = requestTimeoutMillis,
-                wireCodec = codec,
+                session = session,
                 httpClient = httpClient,
                 ownsHttpClient = ownsHttpClient
             )
@@ -227,15 +248,15 @@ class NwcClient private constructor(
             infoSubscriptions.values.forEach { it.cancel() }
             infoSubscriptions.clear()
         }
-        sessionRuntime.shutdown()
+        session.close()
         if (ownsHttpClient) {
             runCatching { httpClient.close() }
         }
     }
 
     suspend fun refreshWalletMetadata(timeoutMillis: Long = requestTimeoutMillis): WalletMetadata {
-        sessionRuntime.sessionHandles.forEach { session ->
-            val metadata = fetchMetadataFrom(session, timeoutMillis)
+        session.runtimeHandles.forEach { handle ->
+            val metadata = fetchMetadataFrom(handle, timeoutMillis)
             if (metadata != null) {
                 walletMetadataState.value = metadata
                 if (EncryptionScheme.Nip44V2 !in metadata.encryptionSchemes) {
@@ -495,12 +516,8 @@ class NwcClient private constructor(
     }
 
     private suspend fun initialize() {
-        val distinctRelays = credentials.relays.distinct()
-        require(distinctRelays.isNotEmpty()) { "No relays provided in credentials" }
-        sessionRuntime.start(
-            relays = distinctRelays,
-            handleOutput = ::handleOutput
-        ) { runtime, _ ->
+        require(credentials.relays.isNotEmpty()) { "No relays provided in credentials" }
+        session.open(handleOutput = ::handleOutput) { runtime, _ ->
             runtime.subscribe(SUBSCRIPTION_RESPONSES, listOf(responseFilter))
             runtime.subscribe(SUBSCRIPTION_NOTIFICATIONS, listOf(notificationFilter))
         }
@@ -625,7 +642,7 @@ class NwcClient private constructor(
     }
 
     private suspend fun publish(event: Event) {
-        sessionRuntime.publish(event)
+        session.sessionRuntime().publish(event)
     }
 
     private fun buildRequestEvent(
