@@ -11,6 +11,7 @@ import io.github.nostr.nwc.internal.TAG_ENCRYPTION
 import io.github.nostr.nwc.internal.TAG_EXPIRATION
 import io.github.nostr.nwc.internal.TAG_P
 import io.github.nostr.nwc.internal.asString
+import io.github.nostr.nwc.internal.defaultNwcHttpClient
 import io.github.nostr.nwc.model.BalanceResult
 import io.github.nostr.nwc.model.BitcoinAmount
 import io.github.nostr.nwc.model.EncryptionScheme
@@ -35,7 +36,6 @@ import io.github.nostr.nwc.model.WalletMetadata
 import io.github.nostr.nwc.model.WalletNotification
 import io.github.nostr.nwc.model.RawResponse
 import io.ktor.client.HttpClient
-import io.ktor.client.plugins.websocket.WebSockets
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.TimeoutCancellationException
@@ -125,7 +125,7 @@ class NwcClient private constructor(
         ): NwcClient {
             val credentials = uri.toCredentials()
             val (client, owns) = httpClient?.let { it to false } ?: run {
-                defaultHttpClient() to true
+                defaultNwcHttpClient() to true
             }
             return create(credentials, scope, client, owns, sessionSettings, requestTimeoutMillis)
         }
@@ -152,9 +152,7 @@ class NwcClient private constructor(
             return client
         }
 
-        private fun defaultHttpClient(): HttpClient = HttpClient {
-            install(WebSockets)
-        }
+        private fun defaultHttpClient(): HttpClient = defaultNwcHttpClient()
     }
 
     private sealed interface PendingRequest {
