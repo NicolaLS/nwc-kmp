@@ -101,7 +101,7 @@ class NwcClient private constructor(
     private val httpClient: HttpClient,
     private val ownsHttpClient: Boolean,
     private val interceptors: List<NwcClientInterceptor>
-) {
+) : NwcClientContract {
 
     private val hasInterceptors = interceptors.isNotEmpty()
 
@@ -209,13 +209,6 @@ class NwcClient private constructor(
     private val walletPublicKeyHex: String = credentials.walletPublicKey.toString()
     private val conversationKey: UByteArray
 
-    private val sessionRuntime = NwcSessionRuntime(
-        scope = scope,
-        httpClient = httpClient,
-        wireCodec = wireCodec,
-        sessionSettings = sessionSettings
-    )
-
     private val pendingMutex = Mutex()
     private val pendingRequests = mutableMapOf<String, PendingRequest>()
 
@@ -223,10 +216,10 @@ class NwcClient private constructor(
     private val infoSubscriptions = mutableMapOf<String, CompletableDeferred<Event?>>()
 
     private val _notifications = MutableSharedFlow<WalletNotification>(replay = 0, extraBufferCapacity = 64)
-    val notifications: SharedFlow<WalletNotification> = _notifications.asSharedFlow()
+    override val notifications: SharedFlow<WalletNotification> = _notifications.asSharedFlow()
 
     private val walletMetadataState = MutableStateFlow<WalletMetadata?>(null)
-    val walletMetadata: StateFlow<WalletMetadata?> = walletMetadataState.asStateFlow()
+    override val walletMetadata: StateFlow<WalletMetadata?> = walletMetadataState.asStateFlow()
 
     private val responseFilter = Filter(
         kinds = setOf(RESPONSE_KIND),
@@ -248,7 +241,7 @@ class NwcClient private constructor(
         )
     }
 
-    suspend fun close() {
+    override suspend fun close() {
         pendingMutex.withLock {
             pendingRequests.values.forEach { request ->
                 when (request) {
@@ -270,7 +263,7 @@ class NwcClient private constructor(
         }
     }
 
-    suspend fun refreshWalletMetadata(timeoutMillis: Long = requestTimeoutMillis): NwcResult<WalletMetadata> =
+    override suspend fun refreshWalletMetadata(timeoutMillis: Long): NwcResult<WalletMetadata> =
         runNwcCatching { refreshWalletMetadataInternal(timeoutMillis) }
 
     private suspend fun refreshWalletMetadataInternal(timeoutMillis: Long): WalletMetadata {
@@ -287,7 +280,7 @@ class NwcClient private constructor(
         throw NwcException("Unable to fetch wallet metadata from configured relays.")
     }
 
-    suspend fun getBalance(timeoutMillis: Long = requestTimeoutMillis): NwcResult<BalanceResult> =
+    override suspend fun getBalance(timeoutMillis: Long): NwcResult<BalanceResult> =
         runNwcCatching { getBalanceInternal(timeoutMillis) }
 
     private suspend fun getBalanceInternal(timeoutMillis: Long): BalanceResult {
@@ -300,7 +293,7 @@ class NwcClient private constructor(
         return BalanceResult(BitcoinAmount.fromMsats(balanceMsats))
     }
 
-    suspend fun getInfo(timeoutMillis: Long = requestTimeoutMillis): NwcResult<GetInfoResult> =
+    override suspend fun getInfo(timeoutMillis: Long): NwcResult<GetInfoResult> =
         runNwcCatching { getInfoInternal(timeoutMillis) }
 
     private suspend fun getInfoInternal(timeoutMillis: Long): GetInfoResult {
@@ -331,9 +324,9 @@ class NwcClient private constructor(
         )
     }
 
-    suspend fun payInvoice(
+    override suspend fun payInvoice(
         params: PayInvoiceParams,
-        timeoutMillis: Long = requestTimeoutMillis
+        timeoutMillis: Long
     ): NwcResult<PayInvoiceResult> = runNwcCatching { payInvoiceInternal(params, timeoutMillis) }
 
     private suspend fun payInvoiceInternal(
@@ -355,9 +348,9 @@ class NwcClient private constructor(
         return PayInvoiceResult(preimage = preimage, feesPaid = feesPaid)
     }
 
-    suspend fun multiPayInvoice(
+    override suspend fun multiPayInvoice(
         invoices: List<MultiPayInvoiceItem>,
-        timeoutMillis: Long = requestTimeoutMillis
+        timeoutMillis: Long
     ): NwcResult<Map<String, MultiResult<PayInvoiceResult>>> =
         runNwcCatching { multiPayInvoiceInternal(invoices, timeoutMillis) }
 
@@ -406,9 +399,9 @@ class NwcClient private constructor(
         }
     }
 
-    suspend fun payKeysend(
+    override suspend fun payKeysend(
         params: KeysendParams,
-        timeoutMillis: Long = requestTimeoutMillis
+        timeoutMillis: Long
     ): NwcResult<KeysendResult> = runNwcCatching { payKeysendInternal(params, timeoutMillis) }
 
     private suspend fun payKeysendInternal(
@@ -440,9 +433,9 @@ class NwcClient private constructor(
         return KeysendResult(preimage, feesPaid)
     }
 
-    suspend fun multiPayKeysend(
+    override suspend fun multiPayKeysend(
         payments: List<MultiKeysendItem>,
-        timeoutMillis: Long = requestTimeoutMillis
+        timeoutMillis: Long
     ): NwcResult<Map<String, MultiResult<KeysendResult>>> =
         runNwcCatching { multiPayKeysendInternal(payments, timeoutMillis) }
 
@@ -507,9 +500,9 @@ class NwcClient private constructor(
         }
     }
 
-    suspend fun makeInvoice(
+    override suspend fun makeInvoice(
         params: MakeInvoiceParams,
-        timeoutMillis: Long = requestTimeoutMillis
+        timeoutMillis: Long
     ): NwcResult<Transaction> = runNwcCatching { makeInvoiceInternal(params, timeoutMillis) }
 
     private suspend fun makeInvoiceInternal(
@@ -529,9 +522,9 @@ class NwcClient private constructor(
         return parseTransaction(obj)
     }
 
-    suspend fun lookupInvoice(
+    override suspend fun lookupInvoice(
         params: LookupInvoiceParams,
-        timeoutMillis: Long = requestTimeoutMillis
+        timeoutMillis: Long
     ): NwcResult<Transaction> = runNwcCatching { lookupInvoiceInternal(params, timeoutMillis) }
 
     private suspend fun lookupInvoiceInternal(
@@ -548,9 +541,9 @@ class NwcClient private constructor(
         return parseTransaction(obj)
     }
 
-    suspend fun listTransactions(
+    override suspend fun listTransactions(
         params: ListTransactionsParams,
-        timeoutMillis: Long = requestTimeoutMillis
+        timeoutMillis: Long
     ): NwcResult<List<Transaction>> = runNwcCatching { listTransactionsInternal(params, timeoutMillis) }
 
     private suspend fun listTransactionsInternal(
@@ -577,7 +570,7 @@ class NwcClient private constructor(
         }
     }
 
-    suspend fun describeWallet(timeoutMillis: Long = requestTimeoutMillis): NwcResult<NwcWalletDescriptor> =
+    override suspend fun describeWallet(timeoutMillis: Long): NwcResult<NwcWalletDescriptor> =
         runNwcCatching { describeWalletInternal(timeoutMillis) }
 
     private suspend fun describeWalletInternal(timeoutMillis: Long): NwcWalletDescriptor {
