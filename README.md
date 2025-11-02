@@ -25,16 +25,22 @@ Please find the detailed guide [here](https://www.jetbrains.com/help/kotlin-mult
 import io.github.nostr.nwc.DEFAULT_REQUEST_TIMEOUT_MS
 import io.github.nostr.nwc.discoverWallet
 import io.github.nostr.nwc.model.NwcCapability
+import io.github.nostr.nwc.model.NwcResult
 
 suspend fun loadDescriptor(connectionUri: String) {
-    val descriptor = discoverWallet(
+    when (val result = discoverWallet(
         uri = connectionUri,
         requestTimeoutMillis = DEFAULT_REQUEST_TIMEOUT_MS
-    )
-    if (NwcCapability.PayInvoice in descriptor.capabilities) {
-        println("Wallet ${'$'}{descriptor.alias} supports paying invoices on ${'$'}{descriptor.network}")
+    )) {
+        is NwcResult.Success -> {
+            val descriptor = result.value
+            if (NwcCapability.PayInvoice in descriptor.capabilities) {
+                println("Wallet ${'$'}{descriptor.alias} supports paying invoices on ${'$'}{descriptor.network}")
+            }
+            descriptor.notifications.forEach { println("Supports notification: ${'$'}it") }
+        }
+        is NwcResult.Failure -> println("Discovery failed: ${'$'}{result.failure}")
     }
-    descriptor.notifications.forEach { println("Supports notification: ${'$'}it") }
 }
 ```
 
@@ -42,7 +48,7 @@ For long-lived integrations, reuse a shared `NwcSession`:
 
 ```kotlin
 val session = NwcSession.create(connectionUri)
-val descriptor = discoverWallet(session)
+val descriptorResult = discoverWallet(session)
 // Later reuse the same session when creating NwcClient instances
 ```
 

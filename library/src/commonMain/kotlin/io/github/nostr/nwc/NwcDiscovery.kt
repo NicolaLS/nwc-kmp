@@ -1,5 +1,6 @@
 package io.github.nostr.nwc
 
+import io.github.nostr.nwc.model.NwcResult
 import io.github.nostr.nwc.model.NwcWalletDescriptor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -11,7 +12,7 @@ suspend fun discoverWallet(
     uri: String,
     sessionSettings: RelaySessionSettings = RelaySessionSettings(),
     requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS
-): NwcWalletDescriptor {
+): NwcResult<NwcWalletDescriptor> {
     val parsed = NwcUri.parse(uri)
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val client = NwcClient.create(
@@ -20,18 +21,19 @@ suspend fun discoverWallet(
         sessionSettings = sessionSettings,
         requestTimeoutMillis = requestTimeoutMillis
     )
-    return try {
+    val result = try {
         client.describeWallet(requestTimeoutMillis)
     } finally {
         client.close()
         scope.cancel()
     }
+    return result
 }
 
 suspend fun discoverWallet(
     session: NwcSession,
     requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS
-): NwcWalletDescriptor {
+): NwcResult<NwcWalletDescriptor> {
     val client = NwcClient.create(
         credentials = session.credentials,
         scope = session.coroutineScope,
@@ -41,9 +43,10 @@ suspend fun discoverWallet(
         ownsHttpClient = false,
         requestTimeoutMillis = requestTimeoutMillis
     )
-    return try {
+    val result = try {
         client.describeWallet(requestTimeoutMillis)
     } finally {
         client.close()
     }
+    return result
 }

@@ -29,6 +29,7 @@ import io.github.nostr.nwc.model.Network
 import io.github.nostr.nwc.model.NwcError
 import io.github.nostr.nwc.model.NwcCapability
 import io.github.nostr.nwc.model.NwcNotificationType
+import io.github.nostr.nwc.model.NwcResult
 import io.github.nostr.nwc.model.NwcWalletDescriptor
 import io.github.nostr.nwc.model.PayInvoiceParams
 import io.github.nostr.nwc.model.PayInvoiceResult
@@ -262,7 +263,10 @@ class NwcClient private constructor(
         }
     }
 
-    suspend fun refreshWalletMetadata(timeoutMillis: Long = requestTimeoutMillis): WalletMetadata {
+    suspend fun refreshWalletMetadata(timeoutMillis: Long = requestTimeoutMillis): NwcResult<WalletMetadata> =
+        runNwcCatching { refreshWalletMetadataInternal(timeoutMillis) }
+
+    private suspend fun refreshWalletMetadataInternal(timeoutMillis: Long): WalletMetadata {
         session.runtimeHandles.forEach { handle ->
             val metadata = fetchMetadataFrom(handle, timeoutMillis)
             if (metadata != null) {
@@ -276,7 +280,10 @@ class NwcClient private constructor(
         throw NwcException("Unable to fetch wallet metadata from configured relays.")
     }
 
-    suspend fun getBalance(timeoutMillis: Long = requestTimeoutMillis): BalanceResult {
+    suspend fun getBalance(timeoutMillis: Long = requestTimeoutMillis): NwcResult<BalanceResult> =
+        runNwcCatching { getBalanceInternal(timeoutMillis) }
+
+    private suspend fun getBalanceInternal(timeoutMillis: Long): BalanceResult {
         val params = buildJsonObject { }
         val response = sendSingleRequest(MethodNames.GET_BALANCE, params, timeoutMillis)
         val jsonResult = response.result as? JsonObject
@@ -286,7 +293,10 @@ class NwcClient private constructor(
         return BalanceResult(BitcoinAmount.fromMsats(balanceMsats))
     }
 
-    suspend fun getInfo(timeoutMillis: Long = requestTimeoutMillis): GetInfoResult {
+    suspend fun getInfo(timeoutMillis: Long = requestTimeoutMillis): NwcResult<GetInfoResult> =
+        runNwcCatching { getInfoInternal(timeoutMillis) }
+
+    private suspend fun getInfoInternal(timeoutMillis: Long): GetInfoResult {
         val params = buildJsonObject { }
         val response = sendSingleRequest(MethodNames.GET_INFO, params, timeoutMillis)
         val obj = response.result as? JsonObject
@@ -317,6 +327,11 @@ class NwcClient private constructor(
     suspend fun payInvoice(
         params: PayInvoiceParams,
         timeoutMillis: Long = requestTimeoutMillis
+    ): NwcResult<PayInvoiceResult> = runNwcCatching { payInvoiceInternal(params, timeoutMillis) }
+
+    private suspend fun payInvoiceInternal(
+        params: PayInvoiceParams,
+        timeoutMillis: Long
     ): PayInvoiceResult {
         val payload = buildJsonObject {
             put("invoice", params.invoice)
@@ -336,6 +351,12 @@ class NwcClient private constructor(
     suspend fun multiPayInvoice(
         invoices: List<MultiPayInvoiceItem>,
         timeoutMillis: Long = requestTimeoutMillis
+    ): NwcResult<Map<String, MultiResult<PayInvoiceResult>>> =
+        runNwcCatching { multiPayInvoiceInternal(invoices, timeoutMillis) }
+
+    private suspend fun multiPayInvoiceInternal(
+        invoices: List<MultiPayInvoiceItem>,
+        timeoutMillis: Long
     ): Map<String, MultiResult<PayInvoiceResult>> {
         require(invoices.isNotEmpty()) { "multiPayInvoice requires at least one invoice" }
         val normalized = invoices.map { item ->
@@ -381,6 +402,11 @@ class NwcClient private constructor(
     suspend fun payKeysend(
         params: KeysendParams,
         timeoutMillis: Long = requestTimeoutMillis
+    ): NwcResult<KeysendResult> = runNwcCatching { payKeysendInternal(params, timeoutMillis) }
+
+    private suspend fun payKeysendInternal(
+        params: KeysendParams,
+        timeoutMillis: Long
     ): KeysendResult {
         val payload = buildJsonObject {
             put("pubkey", params.destinationPubkey)
@@ -410,6 +436,12 @@ class NwcClient private constructor(
     suspend fun multiPayKeysend(
         payments: List<MultiKeysendItem>,
         timeoutMillis: Long = requestTimeoutMillis
+    ): NwcResult<Map<String, MultiResult<KeysendResult>>> =
+        runNwcCatching { multiPayKeysendInternal(payments, timeoutMillis) }
+
+    private suspend fun multiPayKeysendInternal(
+        payments: List<MultiKeysendItem>,
+        timeoutMillis: Long
     ): Map<String, MultiResult<KeysendResult>> {
         require(payments.isNotEmpty()) { "multiPayKeysend requires at least one payment" }
         val normalized = payments.map { item ->
@@ -471,6 +503,11 @@ class NwcClient private constructor(
     suspend fun makeInvoice(
         params: MakeInvoiceParams,
         timeoutMillis: Long = requestTimeoutMillis
+    ): NwcResult<Transaction> = runNwcCatching { makeInvoiceInternal(params, timeoutMillis) }
+
+    private suspend fun makeInvoiceInternal(
+        params: MakeInvoiceParams,
+        timeoutMillis: Long
     ): Transaction {
         val payload = buildJsonObject {
             put("amount", params.amount.msats)
@@ -488,6 +525,11 @@ class NwcClient private constructor(
     suspend fun lookupInvoice(
         params: LookupInvoiceParams,
         timeoutMillis: Long = requestTimeoutMillis
+    ): NwcResult<Transaction> = runNwcCatching { lookupInvoiceInternal(params, timeoutMillis) }
+
+    private suspend fun lookupInvoiceInternal(
+        params: LookupInvoiceParams,
+        timeoutMillis: Long
     ): Transaction {
         val payload = buildJsonObject {
             params.paymentHash?.let { put("payment_hash", it) }
@@ -502,6 +544,11 @@ class NwcClient private constructor(
     suspend fun listTransactions(
         params: ListTransactionsParams,
         timeoutMillis: Long = requestTimeoutMillis
+    ): NwcResult<List<Transaction>> = runNwcCatching { listTransactionsInternal(params, timeoutMillis) }
+
+    private suspend fun listTransactionsInternal(
+        params: ListTransactionsParams,
+        timeoutMillis: Long
     ): List<Transaction> {
         val payload = buildJsonObject {
             params.fromTimestamp?.let { put("from", it) }
@@ -523,9 +570,12 @@ class NwcClient private constructor(
         }
     }
 
-    suspend fun describeWallet(timeoutMillis: Long = requestTimeoutMillis): NwcWalletDescriptor {
-        val metadata = refreshWalletMetadata(timeoutMillis)
-        val info = getInfo(timeoutMillis)
+    suspend fun describeWallet(timeoutMillis: Long = requestTimeoutMillis): NwcResult<NwcWalletDescriptor> =
+        runNwcCatching { describeWalletInternal(timeoutMillis) }
+
+    private suspend fun describeWalletInternal(timeoutMillis: Long): NwcWalletDescriptor {
+        val metadata = refreshWalletMetadataInternal(timeoutMillis)
+        val info = getInfoInternal(timeoutMillis)
         val negotiated = metadata.encryptionSchemes.firstOrNull {
             it is EncryptionScheme.Nip44V2
         } ?: metadata.encryptionSchemes.firstOrNull()
@@ -545,7 +595,7 @@ class NwcClient private constructor(
             runtime.subscribe(SUBSCRIPTION_RESPONSES, listOf(responseFilter))
             runtime.subscribe(SUBSCRIPTION_NOTIFICATIONS, listOf(notificationFilter))
         }
-        refreshWalletMetadata()
+        refreshWalletMetadataInternal(requestTimeoutMillis)
     }
 
     private suspend fun fetchMetadataFrom(
