@@ -88,6 +88,9 @@ class NwcSession private constructor(
     }
 
     internal fun sessionRuntime(): NwcSessionRuntime = runtime
+    internal val coroutineScope: CoroutineScope get() = scope
+    internal val httpClientInternal: HttpClient get() = httpClient
+    internal val ownsHttpClientInternal: Boolean get() = ownsHttpClient
 
     private enum class Lifecycle {
         Idle,

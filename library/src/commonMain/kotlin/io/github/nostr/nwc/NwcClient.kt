@@ -29,6 +29,7 @@ import io.github.nostr.nwc.model.Network
 import io.github.nostr.nwc.model.NwcError
 import io.github.nostr.nwc.model.NwcCapability
 import io.github.nostr.nwc.model.NwcNotificationType
+import io.github.nostr.nwc.model.NwcWalletDescriptor
 import io.github.nostr.nwc.model.PayInvoiceParams
 import io.github.nostr.nwc.model.PayInvoiceResult
 import io.github.nostr.nwc.model.Transaction
@@ -88,13 +89,14 @@ private const val INFO_EVENT_KIND = 13194
 private const val REQUEST_KIND = 23194
 private const val RESPONSE_KIND = 23195
 private const val NOTIFICATION_KIND = 23197
-private const val DEFAULT_TIMEOUT_MILLIS = 30_000L
+const val DEFAULT_REQUEST_TIMEOUT_MS = 30_000L
 
 class NwcClient private constructor(
     private val credentials: NwcCredentials,
     private val scope: CoroutineScope,
     private val requestTimeoutMillis: Long,
     private val session: NwcSession,
+    private val ownsSession: Boolean,
     private val httpClient: HttpClient,
     private val ownsHttpClient: Boolean
 ) {
@@ -105,7 +107,7 @@ class NwcClient private constructor(
             scope: CoroutineScope,
             httpClient: HttpClient? = null,
             sessionSettings: RelaySessionSettings = RelaySessionSettings(),
-            requestTimeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS
+            requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS
         ): NwcClient {
             return create(
                 uri = NwcUri.parse(uri),
@@ -121,7 +123,7 @@ class NwcClient private constructor(
             scope: CoroutineScope,
             httpClient: HttpClient? = null,
             sessionSettings: RelaySessionSettings = RelaySessionSettings(),
-            requestTimeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS
+            requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS
         ): NwcClient {
             val credentials = uri.toCredentials()
             val (client, ownsClient) = httpClient?.let { it to false } ?: run {
@@ -133,7 +135,7 @@ class NwcClient private constructor(
                 httpClient = client,
                 sessionSettings = sessionSettings
             )
-            return create(credentials, scope, session, client, ownsClient, requestTimeoutMillis)
+            return create(credentials, scope, session, ownsSession = true, httpClient = client, ownsHttpClient = ownsClient, requestTimeoutMillis = requestTimeoutMillis)
         }
 
         suspend fun create(
@@ -141,7 +143,7 @@ class NwcClient private constructor(
             scope: CoroutineScope,
             httpClient: HttpClient? = null,
             sessionSettings: RelaySessionSettings = RelaySessionSettings(),
-            requestTimeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS
+            requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS
         ): NwcClient {
             val (client, ownsClient) = httpClient?.let { it to false } ?: run {
                 defaultNwcHttpClient() to true
@@ -152,22 +154,24 @@ class NwcClient private constructor(
                 httpClient = client,
                 sessionSettings = sessionSettings
             )
-            return create(credentials, scope, session, client, ownsClient, requestTimeoutMillis)
+            return create(credentials, scope, session, ownsSession = true, httpClient = client, ownsHttpClient = ownsClient, requestTimeoutMillis = requestTimeoutMillis)
         }
 
         suspend fun create(
             credentials: NwcCredentials,
             scope: CoroutineScope,
             session: NwcSession,
+            ownsSession: Boolean,
             httpClient: HttpClient,
             ownsHttpClient: Boolean = false,
-            requestTimeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS
+            requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS
         ): NwcClient {
             val client = NwcClient(
                 credentials = credentials,
                 scope = scope,
                 requestTimeoutMillis = requestTimeoutMillis,
                 session = session,
+                ownsSession = ownsSession,
                 httpClient = httpClient,
                 ownsHttpClient = ownsHttpClient
             )
@@ -250,7 +254,9 @@ class NwcClient private constructor(
             infoSubscriptions.values.forEach { it.cancel() }
             infoSubscriptions.clear()
         }
-        session.close()
+        if (ownsSession) {
+            session.close()
+        }
         if (ownsHttpClient) {
             runCatching { httpClient.close() }
         }
@@ -515,6 +521,22 @@ class NwcClient private constructor(
             val transactionObj = element as? JsonObject ?: return@mapNotNull null
             runCatching { parseTransaction(transactionObj) }.getOrNull()
         }
+    }
+
+    suspend fun describeWallet(timeoutMillis: Long = requestTimeoutMillis): NwcWalletDescriptor {
+        val metadata = refreshWalletMetadata(timeoutMillis)
+        val info = getInfo(timeoutMillis)
+        val negotiated = metadata.encryptionSchemes.firstOrNull {
+            it is EncryptionScheme.Nip44V2
+        } ?: metadata.encryptionSchemes.firstOrNull()
+        return NwcWalletDescriptor(
+            uri = credentials.toUri(),
+            metadata = metadata,
+            info = info,
+            negotiatedEncryption = negotiated,
+            relays = credentials.relays,
+            lud16 = credentials.lud16
+        )
     }
 
     private suspend fun initialize() {
