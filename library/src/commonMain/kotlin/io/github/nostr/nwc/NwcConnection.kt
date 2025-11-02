@@ -234,3 +234,7 @@ private fun buildNwcUriString(
 
 private fun normalizeRelays(relays: List<String>): List<String> =
     relays.map { it.trim() }.filter { it.isNotEmpty() }
+
+fun String.toNwcUri(): NwcUri = NwcUri.parse(this)
+
+fun String.toNwcCredentials(): NwcCredentials = parseNwcUri(this)

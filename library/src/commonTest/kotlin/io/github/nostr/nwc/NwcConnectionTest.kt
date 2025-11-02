@@ -62,6 +62,18 @@ class NwcConnectionTest {
     }
 
     @Test
+    fun stringExtensionsDelegateToParsers() {
+        val uri = "nostr+walletconnect://$samplePubkey?relay=wss://relay.example&secret=$sampleSecret"
+
+        val fromUri = uri.toNwcUri()
+        val fromCredentials = uri.toNwcCredentials()
+
+        assertEquals(samplePubkey, fromUri.walletPublicKeyHex)
+        assertEquals(samplePubkey, fromCredentials.walletPublicKeyHex)
+        assertEquals(fromUri.toCredentials(), fromCredentials)
+    }
+
+    @Test
     fun missingSecretFails() {
         val uri = "nostr+walletconnect://$samplePubkey?relay=wss://relay.example"
 

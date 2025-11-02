@@ -107,7 +107,23 @@ class NwcClient private constructor(
             sessionSettings: RelaySessionSettings = RelaySessionSettings(),
             requestTimeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS
         ): NwcClient {
-            val credentials = parseNwcUri(uri)
+            return create(
+                uri = NwcUri.parse(uri),
+                scope = scope,
+                httpClient = httpClient,
+                sessionSettings = sessionSettings,
+                requestTimeoutMillis = requestTimeoutMillis
+            )
+        }
+
+        suspend fun create(
+            uri: NwcUri,
+            scope: CoroutineScope,
+            httpClient: HttpClient? = null,
+            sessionSettings: RelaySessionSettings = RelaySessionSettings(),
+            requestTimeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS
+        ): NwcClient {
+            val credentials = uri.toCredentials()
             val (client, owns) = httpClient?.let { it to false } ?: run {
                 defaultHttpClient() to true
             }
