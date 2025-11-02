@@ -89,3 +89,7 @@ Consumers depend only on `NwcClientContract`, making it easy to inject either th
 - `ScriptedWalletHarness` responds to `pay_invoice`, `make_invoice`, and `list_transactions` commands using a deterministic ledger and optional scripts so integration tests can exercise the full flow.
 
 Both utilities live under `io.github.nostr.nwc.testing` and are available on all common Kotlin Multiplatform targets.
+
+## Error Handling
+
+All public APIs return `NwcResult`, exposing rich failure data without throwing. `NwcFailure.Network` now surfaces the upstream `ConnectionFailureReason`, websocket close code/reason, and the original cause string published by the runtime so callers can distinguish connection factory errors from relay handshake issues without parsing log messages.
