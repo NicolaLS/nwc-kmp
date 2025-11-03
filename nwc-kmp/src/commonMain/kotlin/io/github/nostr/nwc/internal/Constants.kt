@@ -17,9 +17,6 @@ internal object NotificationTypes {
     const val PAYMENT_SENT = "payment_sent"
 }
 
-internal const val ENCRYPTION_SCHEME_NIP44 = "nip44_v2"
-internal const val ENCRYPTION_SCHEME_NIP04 = "nip04"
-
 internal const val TAG_ENCRYPTION = "encryption"
 internal const val TAG_P = "p"
 internal const val TAG_E = "e"

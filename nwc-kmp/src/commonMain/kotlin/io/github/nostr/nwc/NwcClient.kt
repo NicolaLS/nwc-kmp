@@ -2,7 +2,6 @@
 
 package io.github.nostr.nwc
 
-import io.github.nostr.nwc.internal.ENCRYPTION_SCHEME_NIP44
 import io.github.nostr.nwc.internal.MethodNames
 import io.github.nostr.nwc.internal.NotificationTypes
 import io.github.nostr.nwc.internal.TAG_D
@@ -75,6 +74,9 @@ import calculateConversationKey as nip44CalculateConversationKey
 import decrypt as nip44Decrypt
 import ensureSodium as nip44EnsureSodium
 import encrypt as nip44Encrypt
+import decryptWithSharedSecret as nip04DecryptWithSharedSecret
+import deriveSharedSecret as nip04DeriveSharedSecret
+import encryptWithSharedSecret as nip04EncryptWithSharedSecret
 import kotlin.random.Random
 import nostr.core.utils.toHexLower
 import io.github.nostr.nwc.internal.NwcSessionRuntime
@@ -83,6 +85,7 @@ import io.github.nostr.nwc.internal.jsonArrayOrNull
 import io.github.nostr.nwc.internal.jsonObjectOrNull
 import io.github.nostr.nwc.internal.longValueOrNull
 import io.github.nostr.nwc.internal.string
+import io.github.nostr.nwc.internal.selectPreferredEncryption
 
 private const val SUBSCRIPTION_RESPONSES = "nwc-responses"
 private const val SUBSCRIPTION_NOTIFICATIONS = "nwc-notifications"
@@ -207,7 +210,13 @@ class NwcClient private constructor(
     private val identity: Identity = SecpIdentity.fromPrivateKey(credentials.secretKey)
     private val clientPublicKeyHex: String = identity.publicKey.toString()
     private val walletPublicKeyHex: String = credentials.walletPublicKey.toString()
-    private val conversationKey: UByteArray
+    private val nip44ConversationKey: UByteArray
+    private val nip04SharedSecret: ByteArray
+    private var activeEncryption: EncryptionScheme = EncryptionScheme.Nip44V2
+    private val supportedEncryptionOrder = listOf(
+        EncryptionScheme.Nip44V2,
+        EncryptionScheme.Nip04
+    )
 
     private val pendingMutex = Mutex()
     private val pendingRequests = mutableMapOf<String, PendingRequest>()
@@ -235,7 +244,11 @@ class NwcClient private constructor(
 
     init {
         nip44EnsureSodium()
-        conversationKey = nip44CalculateConversationKey(
+        nip44ConversationKey = nip44CalculateConversationKey(
+            credentials.secretKey.toByteArray(),
+            credentials.walletPublicKey.toByteArray()
+        )
+        nip04SharedSecret = nip04DeriveSharedSecret(
             credentials.secretKey.toByteArray(),
             credentials.walletPublicKey.toByteArray()
         )
@@ -271,9 +284,7 @@ class NwcClient private constructor(
             val metadata = fetchMetadataFrom(handle, timeoutMillis)
             if (metadata != null) {
                 walletMetadataState.value = metadata
-                if (EncryptionScheme.Nip44V2 !in metadata.encryptionSchemes) {
-                    throw NwcEncryptionException("Wallet does not advertise nip44_v2 support.")
-                }
+                updateActiveEncryption(metadata)
                 return metadata
             }
         }
@@ -576,9 +587,7 @@ class NwcClient private constructor(
     private suspend fun describeWalletInternal(timeoutMillis: Long): NwcWalletDescriptor {
         val metadata = refreshWalletMetadataInternal(timeoutMillis)
         val info = getInfoInternal(timeoutMillis)
-        val negotiated = metadata.encryptionSchemes.firstOrNull {
-            it is EncryptionScheme.Nip44V2
-        } ?: metadata.encryptionSchemes.firstOrNull()
+        val negotiated = activeEncryption
         return NwcWalletDescriptor(
             uri = credentials.toUri(),
             metadata = metadata,
@@ -620,6 +629,12 @@ class NwcClient private constructor(
             session.session.unsubscribe(subscriptionId)
         }
         return resultEvent?.let { parseWalletMetadata(it) }
+    }
+
+    private fun updateActiveEncryption(metadata: WalletMetadata): EncryptionScheme {
+        val selected = selectPreferredEncryption(metadata, supportedEncryptionOrder)
+        activeEncryption = selected
+        return selected
     }
 
     private suspend fun sendSingleRequest(
@@ -744,12 +759,13 @@ class NwcClient private constructor(
             put("params", params)
         }
         val serialized = json.encodeToString(JsonObject.serializer(), body)
-        val encrypted = nip44Encrypt(serialized, conversationKey)
+        val encryption = activeEncryption
+        val encrypted = encryptPayload(serialized, encryption)
         val builder = identity.newEventBuilder()
             .kind(REQUEST_KIND)
-            .addTag(TAG_ENCRYPTION, ENCRYPTION_SCHEME_NIP44)
             .addTag(TAG_P, walletPublicKeyHex)
             .content(encrypted)
+            .addTag(TAG_ENCRYPTION, encryption.wireName)
         expirationSeconds?.let {
             builder.addTag(TAG_EXPIRATION, it.toString())
         }
@@ -846,7 +862,8 @@ class NwcClient private constructor(
         if (event.kind != RESPONSE_KIND) {
             throw NwcProtocolException("Unexpected event kind ${event.kind} for response")
         }
-        val plaintext = nip44Decrypt(event.content, conversationKey)
+        val scheme = event.resolveEncryptionScheme()
+        val plaintext = decryptPayload(event.content, scheme)
         val element = json.parseToJsonElement(plaintext)
         val obj = element as? JsonObject ?: throw NwcProtocolException("Response payload must be JSON object")
         val resultType = obj["result_type"]?.jsonPrimitive?.content
@@ -866,7 +883,8 @@ class NwcClient private constructor(
 
     private fun processNotificationEvent(event: Event) {
         if (event.kind != NOTIFICATION_KIND) return
-        val plaintext = runCatching { nip44Decrypt(event.content, conversationKey) }.getOrNull() ?: return
+        val scheme = runCatching { event.resolveEncryptionScheme() }.getOrNull() ?: return
+        val plaintext = runCatching { decryptPayload(event.content, scheme) }.getOrNull() ?: return
         val element = runCatching { json.parseToJsonElement(plaintext) }.getOrNull() ?: return
         val obj = element as? JsonObject ?: return
         val type = obj.string("notification_type") ?: return
@@ -914,20 +932,47 @@ class NwcClient private constructor(
         )
     }
 
+    private fun encryptPayload(plaintext: String, scheme: EncryptionScheme): String = when (scheme) {
+        EncryptionScheme.Nip44V2 -> nip44Encrypt(plaintext, nip44ConversationKey)
+        EncryptionScheme.Nip04 -> nip04EncryptWithSharedSecret(plaintext, nip04SharedSecret)
+        is EncryptionScheme.Unknown -> throw NwcEncryptionException("Unsupported encryption scheme: ${scheme.wireName}")
+    }
+
+    private fun decryptPayload(payload: String, scheme: EncryptionScheme): String = when (scheme) {
+        EncryptionScheme.Nip44V2 -> nip44Decrypt(payload, nip44ConversationKey)
+        EncryptionScheme.Nip04 -> nip04DecryptWithSharedSecret(payload, nip04SharedSecret)
+        is EncryptionScheme.Unknown -> throw NwcEncryptionException("Unsupported encryption scheme: ${scheme.wireName}")
+    }
+
+    private fun Event.resolveEncryptionScheme(): EncryptionScheme {
+        val raw = tagValue(TAG_ENCRYPTION)
+        val scheme = EncryptionScheme.fromWire(raw) ?: EncryptionScheme.Nip04
+        if (scheme is EncryptionScheme.Unknown) {
+            throw NwcEncryptionException("Unsupported encryption scheme: ${scheme.wireName}")
+        }
+        return scheme
+    }
+
     private fun parseWalletMetadata(event: Event): WalletMetadata {
         val capabilityValues = event.content
             .split(' ', '\n', '\t')
             .mapNotNull { it.trim().takeIf { it.isNotEmpty() } }
         val capabilities = NwcCapability.parseAll(capabilityValues)
         val encryptionTag = event.tagValue(TAG_ENCRYPTION)
-        val encryptionSchemes = EncryptionScheme.parseList(encryptionTag?.replace(',', ' '))
+        val parsedSchemes = EncryptionScheme.parseList(encryptionTag?.replace(',', ' '))
+        val defaultedToNip04 = encryptionTag.isNullOrBlank() && parsedSchemes.isEmpty()
+        val encryptionSchemes = if (defaultedToNip04) {
+            setOf(EncryptionScheme.Nip04)
+        } else {
+            parsedSchemes
+        }
         val notificationsTag = event.tags.firstOrNull { it.firstOrNull() == "notifications" }
         val notificationValues = notificationsTag?.getOrNull(1)
             ?.split(' ')
             ?.mapNotNull { it.trim().takeIf { it.isNotEmpty() } }
             ?: emptyList()
         val notificationTypes = NwcNotificationType.parseAll(notificationValues)
-        return WalletMetadata(capabilities, encryptionSchemes, notificationTypes)
+        return WalletMetadata(capabilities, encryptionSchemes, notificationTypes, defaultedToNip04)
     }
 
     private fun TransactionType.toWire(): String = when (this) {
