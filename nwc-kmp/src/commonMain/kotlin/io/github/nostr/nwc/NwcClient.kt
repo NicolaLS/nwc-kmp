@@ -85,6 +85,7 @@ import io.github.nostr.nwc.internal.jsonArrayOrNull
 import io.github.nostr.nwc.internal.jsonObjectOrNull
 import io.github.nostr.nwc.internal.longValueOrNull
 import io.github.nostr.nwc.internal.string
+import io.github.nostr.nwc.internal.parseEncryptionTagValues
 import io.github.nostr.nwc.internal.selectPreferredEncryption
 
 private const val SUBSCRIPTION_RESPONSES = "nwc-responses"
@@ -862,8 +863,8 @@ class NwcClient private constructor(
         if (event.kind != RESPONSE_KIND) {
             throw NwcProtocolException("Unexpected event kind ${event.kind} for response")
         }
-        val scheme = event.resolveEncryptionScheme()
-        val plaintext = decryptPayload(event.content, scheme)
+        val selection = event.resolveEncryptionScheme()
+        val plaintext = decryptWithSelection(event.content, selection)
         val element = json.parseToJsonElement(plaintext)
         val obj = element as? JsonObject ?: throw NwcProtocolException("Response payload must be JSON object")
         val resultType = obj["result_type"]?.jsonPrimitive?.content
@@ -883,8 +884,8 @@ class NwcClient private constructor(
 
     private fun processNotificationEvent(event: Event) {
         if (event.kind != NOTIFICATION_KIND) return
-        val scheme = runCatching { event.resolveEncryptionScheme() }.getOrNull() ?: return
-        val plaintext = runCatching { decryptPayload(event.content, scheme) }.getOrNull() ?: return
+        val selection = runCatching { event.resolveEncryptionScheme() }.getOrNull() ?: return
+        val plaintext = runCatching { decryptWithSelection(event.content, selection) }.getOrNull() ?: return
         val element = runCatching { json.parseToJsonElement(plaintext) }.getOrNull() ?: return
         val obj = element as? JsonObject ?: return
         val type = obj.string("notification_type") ?: return
@@ -944,13 +945,22 @@ class NwcClient private constructor(
         is EncryptionScheme.Unknown -> throw NwcEncryptionException("Unsupported encryption scheme: ${scheme.wireName}")
     }
 
-    private fun Event.resolveEncryptionScheme(): EncryptionScheme {
-        val raw = tagValue(TAG_ENCRYPTION)
-        val scheme = EncryptionScheme.fromWire(raw) ?: EncryptionScheme.Nip04
-        if (scheme is EncryptionScheme.Unknown) {
-            throw NwcEncryptionException("Unsupported encryption scheme: ${scheme.wireName}")
+    private fun Event.resolveEncryptionScheme(): ResolvedEncryption {
+        val encryptionInfo = parseEncryptionTagValues(tagValues(TAG_ENCRYPTION))
+        return when {
+            encryptionInfo.schemes.any { it is EncryptionScheme.Nip44V2 } ->
+                ResolvedEncryption(EncryptionScheme.Nip44V2, fromTag = true)
+            encryptionInfo.schemes.any { it is EncryptionScheme.Nip04 } ->
+                ResolvedEncryption(EncryptionScheme.Nip04, fromTag = true)
+            encryptionInfo.defaultedToNip04 ->
+                ResolvedEncryption(EncryptionScheme.Nip04, fromTag = false)
+            activeEncryption !is EncryptionScheme.Unknown ->
+                ResolvedEncryption(activeEncryption, fromTag = false)
+            else -> {
+                val raw = tagValues(TAG_ENCRYPTION)?.joinToString(" ") ?: ""
+                throw NwcEncryptionException("Unsupported encryption scheme: $raw")
+            }
         }
-        return scheme
     }
 
     private fun parseWalletMetadata(event: Event): WalletMetadata {
@@ -958,13 +968,11 @@ class NwcClient private constructor(
             .split(' ', '\n', '\t')
             .mapNotNull { it.trim().takeIf { it.isNotEmpty() } }
         val capabilities = NwcCapability.parseAll(capabilityValues)
-        val encryptionTag = event.tagValue(TAG_ENCRYPTION)
-        val parsedSchemes = EncryptionScheme.parseList(encryptionTag?.replace(',', ' '))
-        val defaultedToNip04 = encryptionTag.isNullOrBlank() && parsedSchemes.isEmpty()
-        val encryptionSchemes = if (defaultedToNip04) {
-            setOf(EncryptionScheme.Nip04)
-        } else {
-            parsedSchemes
+        val encryptionInfo = parseEncryptionTagValues(event.tagValues(TAG_ENCRYPTION))
+        val encryptionSchemes = when {
+            encryptionInfo.schemes.isEmpty() && encryptionInfo.defaultedToNip04 -> setOf(EncryptionScheme.Nip04)
+            encryptionInfo.schemes.isNotEmpty() -> encryptionInfo.schemes.toSet()
+            else -> emptySet()
         }
         val notificationsTag = event.tags.firstOrNull { it.firstOrNull() == "notifications" }
         val notificationValues = notificationsTag?.getOrNull(1)
@@ -972,7 +980,7 @@ class NwcClient private constructor(
             ?.mapNotNull { it.trim().takeIf { it.isNotEmpty() } }
             ?: emptyList()
         val notificationTypes = NwcNotificationType.parseAll(notificationValues)
-        return WalletMetadata(capabilities, encryptionSchemes, notificationTypes, defaultedToNip04)
+        return WalletMetadata(capabilities, encryptionSchemes, notificationTypes, encryptionInfo.defaultedToNip04)
     }
 
     private fun TransactionType.toWire(): String = when (this) {
@@ -982,6 +990,28 @@ class NwcClient private constructor(
 
     private fun Event.tagValue(name: String): String? =
         tags.firstOrNull { it.isNotEmpty() && it[0] == name }?.getOrNull(1)
+
+    private fun Event.tagValues(name: String): List<String>? =
+        tags.firstOrNull { it.isNotEmpty() && it[0] == name }
+            ?.drop(1)
+            ?.takeIf { it.isNotEmpty() }
+
+    private fun decryptWithSelection(payload: String, selection: ResolvedEncryption): String {
+        return runCatching { decryptPayload(payload, selection.scheme) }.getOrElse { primaryFailure ->
+            if (!selection.fromTag && selection.scheme is EncryptionScheme.Nip44V2 && canFallbackToNip04()) {
+                try {
+                    return decryptPayload(payload, EncryptionScheme.Nip04)
+                } catch (fallbackFailure: Throwable) {
+                    throw fallbackFailure
+                }
+            } else {
+                throw primaryFailure
+            }
+        }
+    }
+
+    private fun canFallbackToNip04(): Boolean =
+        walletMetadataState.value?.encryptionSchemes?.any { it is EncryptionScheme.Nip04 } == true
 
     private fun randomId(): String {
         val bytes = ByteArray(8)
@@ -1002,6 +1032,11 @@ class NwcClient private constructor(
         val amount: BitcoinAmount,
         val preimage: String?,
         val tlvRecords: List<KeysendTlvRecord>
+    )
+
+    private data class ResolvedEncryption(
+        val scheme: EncryptionScheme,
+        val fromTag: Boolean
     )
 }
 
