@@ -262,6 +262,15 @@ class NwcClient private constructor(
         return preferred ?: EncryptionScheme.Nip44V2
     }
 
+    private fun activeEncryptionOrDefault(): EncryptionScheme =
+        if (activeEncryption !is EncryptionScheme.Unknown) {
+            activeEncryption
+        } else if (canFallbackToNip04()) {
+            EncryptionScheme.Nip04
+        } else {
+            EncryptionScheme.Nip44V2
+        }
+
     private val pendingMutex = Mutex()
     private val pendingRequests = mutableMapOf<String, PendingRequest>()
 
@@ -995,28 +1004,18 @@ class NwcClient private constructor(
 
     private fun Event.resolveEncryptionScheme(): ResolvedEncryption {
         val encryptionInfo = parseEncryptionTagValues(tagValues(TAG_ENCRYPTION))
-        val negotiated = activeEncryption
+        val negotiated = activeEncryptionOrDefault()
 
-        return when {
-            encryptionInfo.schemes.any { it is EncryptionScheme.Nip44V2 } ->
-                ResolvedEncryption(EncryptionScheme.Nip44V2, fromTag = true)
-            encryptionInfo.schemes.any { it is EncryptionScheme.Nip04 } ->
-                ResolvedEncryption(EncryptionScheme.Nip04, fromTag = true)
-            encryptionInfo.defaultedToNip04 -> when {
-                negotiated is EncryptionScheme.Nip44V2 ->
-                    ResolvedEncryption(EncryptionScheme.Nip44V2, fromTag = false)
-                canFallbackToNip04() ->
-                    ResolvedEncryption(EncryptionScheme.Nip04, fromTag = false)
-                negotiated !is EncryptionScheme.Unknown ->
-                    ResolvedEncryption(negotiated, fromTag = false)
-                else -> ResolvedEncryption(EncryptionScheme.Nip04, fromTag = false)
-            }
-            negotiated !is EncryptionScheme.Unknown ->
-                ResolvedEncryption(negotiated, fromTag = false)
-            else -> {
-                val raw = tagValues(TAG_ENCRYPTION)?.joinToString(" ") ?: ""
-                throw NwcEncryptionException("Unsupported encryption scheme: $raw")
-            }
+        val tagScheme = when {
+            encryptionInfo.schemes.any { it is EncryptionScheme.Nip44V2 } -> EncryptionScheme.Nip44V2
+            encryptionInfo.schemes.any { it is EncryptionScheme.Nip04 } -> EncryptionScheme.Nip04
+            else -> null
+        }
+
+        return if (tagScheme != null) {
+            ResolvedEncryption(tagScheme, fromTag = true)
+        } else {
+            ResolvedEncryption(negotiated, fromTag = false)
         }
     }
 
