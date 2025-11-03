@@ -173,12 +173,14 @@ sealed class EncryptionScheme(val wireName: String) {
     data class Unknown(val value: String) : EncryptionScheme(value)
 
     companion object {
-        private val known = listOf(Nip44V2, Nip04).associateBy { it.wireName }
-
         fun fromWire(raw: String?): EncryptionScheme? {
             if (raw.isNullOrBlank()) return null
             val normalized = raw.trim().lowercase()
-            return known[normalized] ?: Unknown(normalized)
+            return when (normalized) {
+                Nip44V2.wireName -> Nip44V2
+                Nip04.wireName -> Nip04
+                else -> Unknown(normalized)
+            }
         }
 
         fun parseList(raw: String?): Set<EncryptionScheme> {
@@ -193,7 +195,8 @@ sealed class EncryptionScheme(val wireName: String) {
 data class WalletMetadata(
     val capabilities: Set<NwcCapability>,
     val encryptionSchemes: Set<EncryptionScheme>,
-    val notificationTypes: Set<NwcNotificationType>
+    val notificationTypes: Set<NwcNotificationType>,
+    val encryptionDefaultedToNip04: Boolean = false
 )
 
 sealed class WalletNotification {
