@@ -104,7 +104,9 @@ class NwcClient private constructor(
     private val ownsSession: Boolean,
     private val httpClient: HttpClient,
     private val ownsHttpClient: Boolean,
-    private val interceptors: List<NwcClientInterceptor>
+    private val interceptors: List<NwcClientInterceptor>,
+    private val initialMetadata: WalletMetadata?,
+    private val initialEncryption: EncryptionScheme?
 ) : NwcClientContract {
 
     private val hasInterceptors = interceptors.isNotEmpty()
@@ -115,14 +117,20 @@ class NwcClient private constructor(
             scope: CoroutineScope,
             httpClient: HttpClient? = null,
             sessionSettings: RelaySessionSettings = RelaySessionSettings(),
-            requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS
+            requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS,
+            cachedMetadata: WalletMetadata? = null,
+            cachedEncryption: EncryptionScheme? = null,
+            interceptors: List<NwcClientInterceptor> = emptyList()
         ): NwcClient {
             return create(
                 uri = NwcUri.parse(uri),
                 scope = scope,
                 httpClient = httpClient,
                 sessionSettings = sessionSettings,
-                requestTimeoutMillis = requestTimeoutMillis
+                requestTimeoutMillis = requestTimeoutMillis,
+                cachedMetadata = cachedMetadata,
+                cachedEncryption = cachedEncryption,
+                interceptors = interceptors
             )
         }
 
@@ -132,6 +140,8 @@ class NwcClient private constructor(
             httpClient: HttpClient? = null,
             sessionSettings: RelaySessionSettings = RelaySessionSettings(),
             requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS,
+            cachedMetadata: WalletMetadata? = null,
+            cachedEncryption: EncryptionScheme? = null,
             interceptors: List<NwcClientInterceptor> = emptyList()
         ): NwcClient {
             val credentials = uri.toCredentials()
@@ -144,7 +154,18 @@ class NwcClient private constructor(
                 httpClient = client,
                 sessionSettings = sessionSettings
             )
-            return create(credentials, scope, session, ownsSession = true, httpClient = client, ownsHttpClient = ownsClient, requestTimeoutMillis = requestTimeoutMillis, interceptors = interceptors)
+            return create(
+                credentials = credentials,
+                scope = scope,
+                session = session,
+                ownsSession = true,
+                httpClient = client,
+                ownsHttpClient = ownsClient,
+                requestTimeoutMillis = requestTimeoutMillis,
+                cachedMetadata = cachedMetadata,
+                cachedEncryption = cachedEncryption,
+                interceptors = interceptors
+            )
         }
 
         suspend fun create(
@@ -153,6 +174,8 @@ class NwcClient private constructor(
             httpClient: HttpClient? = null,
             sessionSettings: RelaySessionSettings = RelaySessionSettings(),
             requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS,
+            cachedMetadata: WalletMetadata? = null,
+            cachedEncryption: EncryptionScheme? = null,
             interceptors: List<NwcClientInterceptor> = emptyList()
         ): NwcClient {
             val (client, ownsClient) = httpClient?.let { it to false } ?: run {
@@ -164,7 +187,18 @@ class NwcClient private constructor(
                 httpClient = client,
                 sessionSettings = sessionSettings
             )
-            return create(credentials, scope, session, ownsSession = true, httpClient = client, ownsHttpClient = ownsClient, requestTimeoutMillis = requestTimeoutMillis, interceptors = interceptors)
+            return create(
+                credentials = credentials,
+                scope = scope,
+                session = session,
+                ownsSession = true,
+                httpClient = client,
+                ownsHttpClient = ownsClient,
+                requestTimeoutMillis = requestTimeoutMillis,
+                cachedMetadata = cachedMetadata,
+                cachedEncryption = cachedEncryption,
+                interceptors = interceptors
+            )
         }
 
         suspend fun create(
@@ -175,6 +209,8 @@ class NwcClient private constructor(
             httpClient: HttpClient,
             ownsHttpClient: Boolean = false,
             requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS,
+            cachedMetadata: WalletMetadata? = null,
+            cachedEncryption: EncryptionScheme? = null,
             interceptors: List<NwcClientInterceptor> = emptyList()
         ): NwcClient {
             val client = NwcClient(
@@ -185,13 +221,13 @@ class NwcClient private constructor(
                 ownsSession = ownsSession,
                 httpClient = httpClient,
                 ownsHttpClient = ownsHttpClient,
-                interceptors = interceptors
+                interceptors = interceptors,
+                initialMetadata = cachedMetadata,
+                initialEncryption = cachedEncryption
             )
             client.initialize()
             return client
         }
-
-        private fun defaultHttpClient(): HttpClient = defaultNwcHttpClient()
     }
 
     private sealed interface PendingRequest {
@@ -213,11 +249,18 @@ class NwcClient private constructor(
     private val walletPublicKeyHex: String = credentials.walletPublicKey.toString()
     private val nip44ConversationKey: UByteArray
     private val nip04SharedSecret: ByteArray
-    private var activeEncryption: EncryptionScheme = EncryptionScheme.Nip44V2
     private val supportedEncryptionOrder = listOf(
         EncryptionScheme.Nip44V2,
         EncryptionScheme.Nip04
     )
+    private var activeEncryption: EncryptionScheme = determineInitialEncryption()
+
+    private fun determineInitialEncryption(): EncryptionScheme {
+        val explicit = initialEncryption?.takeUnless { it is EncryptionScheme.Unknown }
+        if (explicit != null) return explicit
+        val preferred = initialMetadata?.let { preferredEncryptionOrNull(it) }
+        return preferred ?: EncryptionScheme.Nip44V2
+    }
 
     private val pendingMutex = Mutex()
     private val pendingRequests = mutableMapOf<String, PendingRequest>()
@@ -228,7 +271,7 @@ class NwcClient private constructor(
     private val _notifications = MutableSharedFlow<WalletNotification>(replay = 0, extraBufferCapacity = 64)
     override val notifications: SharedFlow<WalletNotification> = _notifications.asSharedFlow()
 
-    private val walletMetadataState = MutableStateFlow<WalletMetadata?>(null)
+    private val walletMetadataState = MutableStateFlow<WalletMetadata?>(initialMetadata)
     override val walletMetadata: StateFlow<WalletMetadata?> = walletMetadataState.asStateFlow()
 
     private val responseFilter = Filter(
@@ -605,7 +648,9 @@ class NwcClient private constructor(
             relaySession.subscribe(SUBSCRIPTION_RESPONSES, listOf(responseFilter))
             relaySession.subscribe(SUBSCRIPTION_NOTIFICATIONS, listOf(notificationFilter))
         }
-        refreshWalletMetadataInternal(requestTimeoutMillis)
+        if (walletMetadataState.value == null) {
+            refreshWalletMetadataInternal(requestTimeoutMillis)
+        }
     }
 
     private suspend fun fetchMetadataFrom(
@@ -637,6 +682,9 @@ class NwcClient private constructor(
         activeEncryption = selected
         return selected
     }
+
+    private fun preferredEncryptionOrNull(metadata: WalletMetadata): EncryptionScheme? =
+        runCatching { selectPreferredEncryption(metadata, supportedEncryptionOrder) }.getOrNull()
 
     private suspend fun sendSingleRequest(
         method: String,
@@ -947,15 +995,24 @@ class NwcClient private constructor(
 
     private fun Event.resolveEncryptionScheme(): ResolvedEncryption {
         val encryptionInfo = parseEncryptionTagValues(tagValues(TAG_ENCRYPTION))
+        val negotiated = activeEncryption
+
         return when {
             encryptionInfo.schemes.any { it is EncryptionScheme.Nip44V2 } ->
                 ResolvedEncryption(EncryptionScheme.Nip44V2, fromTag = true)
             encryptionInfo.schemes.any { it is EncryptionScheme.Nip04 } ->
                 ResolvedEncryption(EncryptionScheme.Nip04, fromTag = true)
-            encryptionInfo.defaultedToNip04 ->
-                ResolvedEncryption(EncryptionScheme.Nip04, fromTag = false)
-            activeEncryption !is EncryptionScheme.Unknown ->
-                ResolvedEncryption(activeEncryption, fromTag = false)
+            encryptionInfo.defaultedToNip04 -> when {
+                negotiated is EncryptionScheme.Nip44V2 ->
+                    ResolvedEncryption(EncryptionScheme.Nip44V2, fromTag = false)
+                canFallbackToNip04() ->
+                    ResolvedEncryption(EncryptionScheme.Nip04, fromTag = false)
+                negotiated !is EncryptionScheme.Unknown ->
+                    ResolvedEncryption(negotiated, fromTag = false)
+                else -> ResolvedEncryption(EncryptionScheme.Nip04, fromTag = false)
+            }
+            negotiated !is EncryptionScheme.Unknown ->
+                ResolvedEncryption(negotiated, fromTag = false)
             else -> {
                 val raw = tagValues(TAG_ENCRYPTION)?.joinToString(" ") ?: ""
                 throw NwcEncryptionException("Unsupported encryption scheme: $raw")
