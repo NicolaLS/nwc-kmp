@@ -2,6 +2,7 @@ package io.github.nostr.nwc.internal
 
 import io.github.nostr.nwc.NwcRetryPolicy
 import io.github.nostr.nwc.internal.NwcSessionRuntime.SessionHandle
+import io.github.nostr.nwc.logging.NwcLog
 import io.github.nostr.nwc.model.RelayConnectionStatus
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.CoroutineScope
@@ -27,6 +28,8 @@ internal class NwcSessionRuntime(
     private val sessionSettings: RelaySessionSettings,
     private val retryPolicy: NwcRetryPolicy
 ) {
+
+    private val logTag = "NwcSessionRuntime"
 
     internal data class SessionHandle internal constructor(
         val url: String,
@@ -68,15 +71,18 @@ internal class NwcSessionRuntime(
             throw IllegalStateException("NWC session runtime already started")
         }
         relays.distinct().forEach { relay ->
+            NwcLog.info(logTag) { "Acquiring relay session for $relay" }
             updateRelayState(relay, RelayConnectionStatus.CONNECTING)
             val managed = sessionManager.acquire(relay)
             val outputsJob = scope.launch {
                 managed.outputs.collect { output ->
+                    NwcLog.trace(logTag) { "Output from $relay: ${output::class.simpleName}" }
                     handleOutput(relay, output)
                 }
             }
             val snapshotsJob = scope.launch {
                 managed.connectionSnapshots.collect { snapshot ->
+                    NwcLog.debug(logTag) { "Relay $relay snapshot ${snapshot::class.simpleName}" }
                     updateRelayState(relay, snapshot.toRelayStatus())
                     if (retryPolicy.enabled) {
                         scheduleReconnectIfNeeded(relay, snapshot)
@@ -88,17 +94,20 @@ internal class NwcSessionRuntime(
                 configure(managed, relay)
             }
             if (started.isFailure) {
+                NwcLog.error(logTag, started.exceptionOrNull()) { "Failed to start relay session for $relay" }
                 snapshotsJob.cancel()
                 outputsJob.cancel()
                 reconnectJobs.remove(relay)?.cancel()
                 managed.release()
                 throw started.exceptionOrNull()!!
             }
+            NwcLog.info(logTag) { "Relay session established for $relay" }
             sessions[relay] = RelaySession(relay, managed, outputsJob, snapshotsJob)
         }
     }
 
     suspend fun publish(event: Event) {
+        NwcLog.debug(logTag) { "Publishing event ${event.id} to ${sessions.size} relay(s)" }
         var successful = false
         var failure: Throwable? = null
         sessions.values.forEach { session ->
@@ -106,23 +115,39 @@ internal class NwcSessionRuntime(
             if (result.isSuccess) {
                 successful = true
             } else {
+                NwcLog.warn(logTag, result.exceptionOrNull()) { "Failed to publish event ${event.id} to relay ${session.url}" }
                 failure = result.exceptionOrNull()
             }
         }
         if (!successful) {
+            NwcLog.error(logTag, failure) { "Failed to publish event ${event.id} to any relay" }
             throw failure ?: IllegalStateException("Failed to publish event ${event.id}")
         }
     }
 
     suspend fun publishTo(relay: String, event: Event) {
-        sessions[relay]?.session?.publish(event)
+        val session = sessions[relay]
+        if (session == null) {
+            NwcLog.warn(logTag) { "Ignoring publish to $relay; no active session" }
+            return
+        }
+        runCatching { session.session.publish(event) }
+            .onFailure { NwcLog.warn(logTag, it) { "Failed to publish event ${event.id} to relay $relay" } }
     }
 
     suspend fun authenticate(relay: String, event: Event) {
-        sessions[relay]?.session?.authenticate(event)
+        val session = sessions[relay]
+        if (session == null) {
+            NwcLog.warn(logTag) { "Ignoring auth dispatch to $relay; no active session" }
+            return
+        }
+        val result = runCatching { session.session.authenticate(event) }
+        result.onFailure { NwcLog.warn(logTag, it) { "Failed to send auth event ${event.id} to relay $relay" } }
+        result.getOrThrow()
     }
 
     suspend fun shutdown() {
+        NwcLog.info(logTag) { "Shutting down session runtime" }
         shuttingDown = true
         reconnectJobs.values.forEach { it.cancel() }
         reconnectJobs.clear()
@@ -135,11 +160,13 @@ internal class NwcSessionRuntime(
         }
         sessionManager.shutdown()
         relayStates.value = emptyMap()
+        NwcLog.info(logTag) { "Session runtime shutdown complete" }
     }
 
     private fun updateRelayState(relay: String, status: RelayConnectionStatus) {
         val current = relayStates.value
         if (current[relay] == status) return
+        NwcLog.debug(logTag) { "Relay $relay connection state -> $status" }
         relayStates.value = current + (relay to status)
     }
 
@@ -155,7 +182,9 @@ internal class NwcSessionRuntime(
         val session = sessions[relay] ?: return
         reconnectJobs[relay] = scope.launch {
             delay(retryPolicy.reconnectDelayMillis)
+            NwcLog.info(logTag) { "Reconnecting relay $relay after ${retryPolicy.reconnectDelayMillis}ms" }
             kotlin.runCatching { session.session.connect() }
+                .onFailure { NwcLog.warn(logTag, it) { "Reconnect attempt failed for relay $relay" } }
         }
     }
 

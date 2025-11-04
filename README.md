@@ -94,6 +94,39 @@ Consumers depend only on `NwcClientContract`, making it easy to inject either th
 
 Both utilities live under `io.github.nostr.nwc.testing` and are available on all common Kotlin Multiplatform targets.
 
+## Logging
+
+`nwc-kmp` now exposes a lightweight, multiplatform logging facade inspired by best practices from libraries such as [Touchlab Kermit](https://github.com/touchlab/Kermit). By default logging is disabled (minimum level `WARN`) so existing applications remain silent. Consumers can opt in and route structured events through their preferred logger.
+
+```kotlin
+import co.touchlab.kermit.Logger
+import co.touchlab.kermit.StaticConfig
+import co.touchlab.kermit.logcat.LogcatLogger
+import io.github.nostr.nwc.logging.ConsoleNwcLogger
+import io.github.nostr.nwc.logging.NwcLog
+import io.github.nostr.nwc.logging.NwcLogLevel
+import io.github.nostr.nwc.logging.NwcLogger
+
+// Simple stdout logging (all platforms)
+NwcLog.setLogger(ConsoleNwcLogger)
+NwcLog.setMinimumLevel(NwcLogLevel.DEBUG)
+
+// Or plug in your own bridge (Kermit example)
+val kermit = Logger(config = StaticConfig(minSeverity = co.touchlab.kermit.Severity.Info), writerList = listOf(LogcatLogger()))
+NwcLog.setLogger(NwcLogger { level, tag, throwable, message ->
+    val severity = when (level) {
+        NwcLogLevel.TRACE -> co.touchlab.kermit.Severity.Verbose
+        NwcLogLevel.DEBUG -> co.touchlab.kermit.Severity.Debug
+        NwcLogLevel.INFO -> co.touchlab.kermit.Severity.Info
+        NwcLogLevel.WARN -> co.touchlab.kermit.Severity.Warn
+        NwcLogLevel.ERROR -> co.touchlab.kermit.Severity.Error
+    }
+    kermit.log(severity = severity, tag = tag, throwable = throwable, message = message)
+})
+```
+
+Key events—relay session lifecycle, request publication, NIP-42 authentication negotiation, and error hand-offs—emit at `INFO`/`WARN` while lower-level chatter (individual outputs and resends) uses `DEBUG`/`TRACE`. Tune `NwcLog.setMinimumLevel` to trade verbosity for insight when diagnosing relays that require authentication.
+
 ## Error Handling
 
 All public APIs return `NwcResult`, exposing rich failure data without throwing. `NwcFailure.Network` now surfaces the upstream `ConnectionFailureReason`, websocket close code/reason, and the original cause string published by the runtime so callers can distinguish connection factory errors from relay handshake issues without parsing log messages.

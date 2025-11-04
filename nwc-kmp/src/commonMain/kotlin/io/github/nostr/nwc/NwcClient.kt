@@ -11,6 +11,7 @@ import io.github.nostr.nwc.internal.TAG_EXPIRATION
 import io.github.nostr.nwc.internal.TAG_P
 import io.github.nostr.nwc.internal.asString
 import io.github.nostr.nwc.internal.defaultNwcHttpClient
+import io.github.nostr.nwc.logging.NwcLog
 import io.github.nostr.nwc.model.BalanceResult
 import io.github.nostr.nwc.model.BitcoinAmount
 import io.github.nostr.nwc.model.EncryptionScheme
@@ -114,6 +115,7 @@ class NwcClient private constructor(
 ) : NwcClientContract {
 
     private val hasInterceptors = interceptors.isNotEmpty()
+    private val logTag = "NwcClient"
 
     companion object {
         suspend fun create(
@@ -680,11 +682,16 @@ class NwcClient private constructor(
 
     private suspend fun initialize() {
         require(credentials.relays.isNotEmpty()) { "No relays provided in credentials" }
+        NwcLog.info(logTag) {
+            "Opening NWC session for ${credentials.walletPublicKeyHex} across ${credentials.relays.size} relay(s)"
+        }
         session.open(handleOutput = ::handleOutput) { relaySession, _ ->
+            NwcLog.debug(logTag) { "Subscribing to response streams on relay ${relaySession.url}" }
             relaySession.subscribe(SUBSCRIPTION_RESPONSES, listOf(responseFilter))
             relaySession.subscribe(SUBSCRIPTION_NOTIFICATIONS, listOf(notificationFilter))
         }
         if (walletMetadataState.value == null) {
+            NwcLog.debug(logTag) { "No cached metadata available, issuing initial describe_wallet request" }
             refreshWalletMetadataInternal(requestTimeoutMillis)
         }
     }
@@ -703,12 +710,17 @@ class NwcClient private constructor(
         )
         session.session.subscribe(subscriptionId, listOf(filter))
         val resultEvent = try {
+            NwcLog.debug(logTag) { "Waiting for wallet metadata via subscription $subscriptionId on relay ${session.url}" }
             withTimeout(timeoutMillis) { deferred.await() }
         } catch (_: TimeoutCancellationException) {
+            NwcLog.warn(logTag) { "Timed out waiting for wallet metadata on relay ${session.url}" }
             null
         } finally {
             infoMutex.withLock { infoSubscriptions.remove(subscriptionId) }
             session.session.unsubscribe(subscriptionId)
+        }
+        if (resultEvent != null) {
+            NwcLog.debug(logTag) { "Received wallet metadata event ${resultEvent.id} from relay ${session.url}" }
         }
         return resultEvent?.let { parseWalletMetadata(it) }
     }
@@ -735,12 +747,15 @@ class NwcClient private constructor(
         val deferred = CompletableDeferred<RawResponse>()
         registerPending(event.id, PendingRequest.Single(method, event, deferred))
         try {
+            NwcLog.debug(logTag) { "Publishing $method request as event ${event.id}" }
             publish(event)
         } catch (failure: Throwable) {
+            NwcLog.error(logTag, failure) { "Failed to publish $method request event ${event.id}" }
             removePending(event.id, deferred)
             throw NwcException("Failed to publish request $method", failure)
         }
         val response = awaitSingleResponse(method, event.id, deferred, timeoutMillis)
+        NwcLog.debug(logTag) { "Received response for $method request event ${event.id}" }
         response.error?.let { throw NwcRequestException(it) }
         if (hasInterceptors) {
             interceptors.forEach { it.onResponse(method, response) }
@@ -772,14 +787,17 @@ class NwcClient private constructor(
             )
         )
         try {
+            NwcLog.debug(logTag) { "Publishing multi request $method (event ${event.id}) expecting ${expectedKeys.size} keys" }
             publish(event)
         } catch (failure: Throwable) {
+            NwcLog.error(logTag, failure) { "Failed to publish multi request $method event ${event.id}" }
             removePending(event.id, deferred)
             throw NwcException("Failed to publish multi request $method", failure)
         }
         val responses = try {
             withTimeout(timeoutMillis) { deferred.await() }
         } catch (timeout: TimeoutCancellationException) {
+            NwcLog.warn(logTag, timeout) { "Timed out waiting for responses to $method request event ${event.id}" }
             throw NwcTimeoutException("Timed out waiting for $method responses", timeout)
         } finally {
             pendingMutex.withLock { pendingRequests.remove(event.id) }
@@ -789,6 +807,7 @@ class NwcClient private constructor(
                 interceptors.forEach { it.onResponse(method, response) }
             }
         }
+        NwcLog.debug(logTag) { "Collected ${responses.size} responses for $method event ${event.id}" }
         return responses
     }
 
@@ -864,7 +883,12 @@ class NwcClient private constructor(
             is RelaySessionOutput.PublishAcknowledged -> handlePublishAcknowledged(relay, output.result)
             is RelaySessionOutput.EventReceived -> handleEvent(output.subscriptionId, output.event)
             is RelaySessionOutput.EndOfStoredEvents -> handleEndOfEvents(output.subscriptionId)
-            is RelaySessionOutput.SubscriptionTerminated -> handleSubscriptionTerminated(output.subscriptionId)
+            is RelaySessionOutput.SubscriptionTerminated -> handleSubscriptionTerminated(output)
+            is RelaySessionOutput.Notice -> NwcLog.info(logTag) { "Relay $relay notice: ${output.message}" }
+            is RelaySessionOutput.Error -> NwcLog.error(logTag) { "Relay $relay error: ${output.error}" }
+            is RelaySessionOutput.ConnectionStateChanged -> NwcLog.debug(logTag) {
+                "Relay $relay connection snapshot ${output.snapshot}"
+            }
             else -> Unit
         }
     }
@@ -883,17 +907,24 @@ class NwcClient private constructor(
         infoMutex.withLock {
             infoSubscriptions[id]?.takeIf { !it.isCompleted }?.complete(null)
         }
+        NwcLog.debug(logTag) { "Relay signaled end-of-stored-events for subscription $id" }
     }
 
-    private suspend fun handleSubscriptionTerminated(subscriptionId: SubscriptionId) {
-        val id = subscriptionId.value
+    private suspend fun handleSubscriptionTerminated(message: RelaySessionOutput.SubscriptionTerminated) {
+        val id = message.subscriptionId.value
         infoMutex.withLock {
             infoSubscriptions[id]?.takeIf { !it.isCompleted }?.complete(null)
         }
+        val details = buildString {
+            append("Relay terminated subscription $id: ${message.reason}")
+            message.code?.let { append(" (code=$it)") }
+        }
+        NwcLog.warn(logTag) { details }
     }
 
     private suspend fun handleAuthChallenge(relay: String, challenge: RelaySessionOutput.AuthChallenge) {
         val relayUrl = challenge.relayUrl?.takeUnless { it.isBlank() } ?: relay
+        NwcLog.info(logTag) { "Relay $relay issued NIP-42 challenge '${challenge.challenge.take(16)}${if (challenge.challenge.length > 16) "…" else ""}'" }
         val pendingRequestIds = authMutex.withLock {
             val state = relayAuthStates.getOrPut(relay) { RelayAuthState() }
             state.relayUrl = relayUrl
@@ -912,6 +943,7 @@ class NwcClient private constructor(
             authMutex.withLock {
                 relayAuthStates[relay]?.pendingRequestIds?.addAll(pendingRequestIds)
             }
+            NwcLog.error(logTag) { "Failed to build NIP-42 auth event for relay $relay" }
             return
         }
         try {
@@ -921,19 +953,25 @@ class NwcClient private constructor(
                 state.lastAuthAccepted = null
                 state.lastAuthMessage = null
             }
+            NwcLog.debug(logTag) { "Dispatching auth event ${authEvent.id} to relay $relay" }
             session.sessionRuntime().authenticate(relay, authEvent)
         } catch (_: Throwable) {
             authMutex.withLock {
                 relayAuthStates[relay]?.pendingRequestIds?.addAll(pendingRequestIds)
             }
+            NwcLog.warn(logTag) { "Failed to send auth event ${authEvent.id} to relay $relay; will retry when possible" }
             return
         }
         if (pendingRequestIds.isNotEmpty()) {
+            NwcLog.debug(logTag) { "Retrying ${pendingRequestIds.size} pending request(s) after auth on relay $relay" }
             resendPendingRequests(relay, pendingRequestIds)
         }
     }
 
     private suspend fun handlePublishAcknowledged(relay: String, result: PublishResult) {
+        NwcLog.debug(logTag) {
+            "Relay $relay acknowledged event ${result.eventId}: accepted=${result.accepted}, code=${result.code}, message='${result.message}'"
+        }
         val handledAuth = authMutex.withLock {
             val state = relayAuthStates[relay]
             if (state?.lastAuthEventId == result.eventId) {
@@ -942,6 +980,8 @@ class NwcClient private constructor(
                 if (!result.accepted) {
                     state.challenge = null
                 }
+                val status = if (result.accepted) "accepted" else "rejected"
+                NwcLog.info(logTag) { "Relay $relay $status auth event ${result.eventId}: ${result.message}" }
                 true
             } else {
                 false
@@ -950,7 +990,12 @@ class NwcClient private constructor(
         if (handledAuth) return
         val requiresAuth = !result.accepted && result.code?.equals(AUTH_REQUIRED_CODE, ignoreCase = true) == true
         if (requiresAuth) {
+            NwcLog.debug(logTag) { "Relay $relay rejected publish ${result.eventId} with auth-required" }
             handleAuthRequired(relay, result)
+        } else if (!result.accepted) {
+            NwcLog.warn(logTag) {
+                "Relay $relay rejected event ${result.eventId} with code=${result.code ?: "unknown"} message='${result.message}'"
+            }
         }
     }
 
@@ -960,6 +1005,7 @@ class NwcClient private constructor(
             val pending = pendingRequests[result.eventId] as? PendingRequest ?: return@withLock false
             val attempts = pending.relayAttempts[relay] ?: 0
             if (attempts >= MAX_AUTH_RETRIES_PER_RELAY) {
+                NwcLog.warn(logTag) { "Relay $relay still requires auth for event ${result.eventId} after $attempts attempts; giving up" }
                 false
             } else {
                 currentAttempts = attempts
@@ -975,6 +1021,7 @@ class NwcClient private constructor(
             val challengeValue = state.challenge
             if (challengeValue == null) {
                 state.pendingRequestIds.add(result.eventId)
+                NwcLog.debug(logTag) { "Queued request ${result.eventId} until challenge arrives for relay $relay" }
             }
             challengeValue
         } ?: return
@@ -998,6 +1045,7 @@ class NwcClient private constructor(
             }
             session.sessionRuntime().authenticate(relay, authEvent)
         } catch (_: Throwable) {
+            NwcLog.warn(logTag) { "Failed to send retry auth event for relay $relay" }
             authMutex.withLock {
                 relayAuthStates[relay]?.pendingRequestIds?.add(result.eventId)
             }
@@ -1007,6 +1055,7 @@ class NwcClient private constructor(
         pendingMutex.withLock {
             (pendingRequests[result.eventId] as? PendingRequest)?.relayAttempts?.set(relay, currentAttempts + 1)
         }
+        NwcLog.debug(logTag) { "Auth attempt ${currentAttempts + 1} dispatched for event ${result.eventId} on relay $relay" }
         resendPendingRequests(relay, listOf(result.eventId))
     }
 
@@ -1015,7 +1064,12 @@ class NwcClient private constructor(
             val event = pendingMutex.withLock {
                 (pendingRequests[requestId] as? PendingRequest)?.event
             } ?: continue
-            runCatching { session.sessionRuntime().publishTo(relay, event) }
+            runCatching {
+                NwcLog.debug(logTag) { "Replaying request event $requestId to relay $relay" }
+                session.sessionRuntime().publishTo(relay, event)
+            }.onFailure {
+                NwcLog.warn(logTag, it) { "Failed to replay request event $requestId to relay $relay" }
+            }
         }
     }
 
@@ -1031,6 +1085,7 @@ class NwcClient private constructor(
         val requestId = event.tagValue(TAG_E) ?: return
         val rawResponse = runCatching { decodeResponse(event) }.getOrElse { failure ->
             val error = NwcError("DECRYPTION_FAILED", failure.message ?: "Failed to decrypt response")
+            NwcLog.error(logTag, failure) { "Failed to decrypt response for request ${event.tagValue(TAG_E)}" }
             completeRequestError(requestId, error)
             return
         }
@@ -1038,6 +1093,7 @@ class NwcClient private constructor(
             when (val pending = pendingRequests[requestId]) {
                 is PendingRequest.Single -> {
                     if (!pending.deferred.isCompleted) {
+                        NwcLog.debug(logTag) { "Completing single response for event $requestId" }
                         pending.deferred.complete(rawResponse)
                     }
                 }
@@ -1046,6 +1102,7 @@ class NwcClient private constructor(
                     if (key != null && !pending.results.containsKey(key)) {
                         pending.results[key] = rawResponse
                         if (pending.results.keys.containsAll(pending.expectedKeys)) {
+                            NwcLog.debug(logTag) { "Collected final multi response for event $requestId" }
                             pending.deferred.complete(pending.results.toMap())
                             pendingRequests.remove(requestId)
                         }
@@ -1064,10 +1121,16 @@ class NwcClient private constructor(
     private suspend fun completeRequestError(requestId: String, error: NwcError) {
         pendingMutex.withLock {
             when (val pending = pendingRequests.remove(requestId)) {
-                is PendingRequest.Single -> pending.deferred.complete(RawResponse("", null, error))
-                is PendingRequest.Multi -> pending.deferred.complete(
-                    pending.expectedKeys.associateWith { RawResponse("", null, error) }
-                )
+                is PendingRequest.Single -> {
+                    NwcLog.warn(logTag) { "Completing request $requestId with error ${error.code}" }
+                    pending.deferred.complete(RawResponse("", null, error))
+                }
+                is PendingRequest.Multi -> {
+                    NwcLog.warn(logTag) { "Completing multi request $requestId with error ${error.code}" }
+                    pending.deferred.complete(
+                        pending.expectedKeys.associateWith { RawResponse("", null, error) }
+                    )
+                }
                 else -> Unit
             }
         }
