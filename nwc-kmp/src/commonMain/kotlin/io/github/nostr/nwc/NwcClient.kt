@@ -36,8 +36,9 @@ import io.github.nostr.nwc.model.Transaction
 import io.github.nostr.nwc.model.TransactionState
 import io.github.nostr.nwc.model.TransactionType
 import io.github.nostr.nwc.model.WalletMetadata
-import io.github.nostr.nwc.model.WalletNotification
+import io.github.nicolals.nostr.nips.nip42.Nip42Auth
 import io.github.nostr.nwc.model.RawResponse
+import io.github.nostr.nwc.model.WalletNotification
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -66,6 +67,7 @@ import kotlin.ExperimentalUnsignedTypes
 import nostr.core.identity.Identity
 import nostr.core.model.Event
 import nostr.core.model.Filter
+import nostr.core.model.PublishResult
 import nostr.core.model.SubscriptionId
 import nostr.core.session.RelaySessionOutput
 import nostr.core.session.RelaySessionSettings
@@ -94,6 +96,8 @@ private const val INFO_EVENT_KIND = 13194
 private const val REQUEST_KIND = 23194
 private const val RESPONSE_KIND = 23195
 private const val NOTIFICATION_KIND = 23197
+private const val AUTH_REQUIRED_CODE = "auth-required"
+private const val MAX_AUTH_RETRIES_PER_RELAY = 2
 const val DEFAULT_REQUEST_TIMEOUT_MS = 30_000L
 
 class NwcClient private constructor(
@@ -231,18 +235,35 @@ class NwcClient private constructor(
     }
 
     private sealed interface PendingRequest {
+        val method: String
+        val event: Event
+        val relayAttempts: MutableMap<String, Int>
+
         class Single(
-            val method: String,
-            val deferred: CompletableDeferred<RawResponse>
+            override val method: String,
+            override val event: Event,
+            val deferred: CompletableDeferred<RawResponse>,
+            override val relayAttempts: MutableMap<String, Int> = mutableMapOf()
         ) : PendingRequest
 
         class Multi(
-            val method: String,
+            override val method: String,
+            override val event: Event,
             val expectedKeys: Set<String>,
             val results: MutableMap<String, RawResponse>,
-            val deferred: CompletableDeferred<Map<String, RawResponse>>
+            val deferred: CompletableDeferred<Map<String, RawResponse>>,
+            override val relayAttempts: MutableMap<String, Int> = mutableMapOf()
         ) : PendingRequest
     }
+
+    private data class RelayAuthState(
+        var relayUrl: String? = null,
+        var challenge: String? = null,
+        var lastAuthEventId: String? = null,
+        var lastAuthAccepted: Boolean? = null,
+        var lastAuthMessage: String? = null,
+        val pendingRequestIds: MutableSet<String> = mutableSetOf()
+    )
 
     private val identity: Identity = SecpIdentity.fromPrivateKey(credentials.secretKey)
     private val clientPublicKeyHex: String = identity.publicKey.toString()
@@ -273,6 +294,9 @@ class NwcClient private constructor(
 
     private val pendingMutex = Mutex()
     private val pendingRequests = mutableMapOf<String, PendingRequest>()
+
+    private val authMutex = Mutex()
+    private val relayAuthStates = mutableMapOf<String, RelayAuthState>()
 
     private val infoMutex = Mutex()
     private val infoSubscriptions = mutableMapOf<String, CompletableDeferred<Event?>>()
@@ -320,6 +344,9 @@ class NwcClient private constructor(
         infoMutex.withLock {
             infoSubscriptions.values.forEach { it.cancel() }
             infoSubscriptions.clear()
+        }
+        authMutex.withLock {
+            relayAuthStates.clear()
         }
         if (ownsSession) {
             session.close()
@@ -706,7 +733,7 @@ class NwcClient private constructor(
         }
         val event = buildRequestEvent(method, params, expirationSeconds)
         val deferred = CompletableDeferred<RawResponse>()
-        registerPending(event.id, PendingRequest.Single(method, deferred))
+        registerPending(event.id, PendingRequest.Single(method, event, deferred))
         try {
             publish(event)
         } catch (failure: Throwable) {
@@ -738,6 +765,7 @@ class NwcClient private constructor(
             event.id,
             PendingRequest.Multi(
                 method = method,
+                event = event,
                 expectedKeys = expectedKeys,
                 results = mutableMapOf(),
                 deferred = deferred
@@ -832,6 +860,8 @@ class NwcClient private constructor(
 
     private suspend fun handleOutput(relay: String, output: RelaySessionOutput) {
         when (output) {
+            is RelaySessionOutput.AuthChallenge -> handleAuthChallenge(relay, output)
+            is RelaySessionOutput.PublishAcknowledged -> handlePublishAcknowledged(relay, output.result)
             is RelaySessionOutput.EventReceived -> handleEvent(output.subscriptionId, output.event)
             is RelaySessionOutput.EndOfStoredEvents -> handleEndOfEvents(output.subscriptionId)
             is RelaySessionOutput.SubscriptionTerminated -> handleSubscriptionTerminated(output.subscriptionId)
@@ -859,6 +889,133 @@ class NwcClient private constructor(
         val id = subscriptionId.value
         infoMutex.withLock {
             infoSubscriptions[id]?.takeIf { !it.isCompleted }?.complete(null)
+        }
+    }
+
+    private suspend fun handleAuthChallenge(relay: String, challenge: RelaySessionOutput.AuthChallenge) {
+        val relayUrl = challenge.relayUrl?.takeUnless { it.isBlank() } ?: relay
+        val pendingRequestIds = authMutex.withLock {
+            val state = relayAuthStates.getOrPut(relay) { RelayAuthState() }
+            state.relayUrl = relayUrl
+            state.challenge = challenge.challenge
+            val pending = state.pendingRequestIds.toList()
+            state.pendingRequestIds.clear()
+            pending
+        }
+        val authEvent = try {
+            Nip42Auth.buildAuthEvent(
+                signer = identity,
+                relayUrl = relayUrl,
+                challenge = challenge.challenge
+            )
+        } catch (_: Throwable) {
+            authMutex.withLock {
+                relayAuthStates[relay]?.pendingRequestIds?.addAll(pendingRequestIds)
+            }
+            return
+        }
+        try {
+            authMutex.withLock {
+                val state = relayAuthStates.getOrPut(relay) { RelayAuthState() }
+                state.lastAuthEventId = authEvent.id
+                state.lastAuthAccepted = null
+                state.lastAuthMessage = null
+            }
+            session.sessionRuntime().authenticate(relay, authEvent)
+        } catch (_: Throwable) {
+            authMutex.withLock {
+                relayAuthStates[relay]?.pendingRequestIds?.addAll(pendingRequestIds)
+            }
+            return
+        }
+        if (pendingRequestIds.isNotEmpty()) {
+            resendPendingRequests(relay, pendingRequestIds)
+        }
+    }
+
+    private suspend fun handlePublishAcknowledged(relay: String, result: PublishResult) {
+        val handledAuth = authMutex.withLock {
+            val state = relayAuthStates[relay]
+            if (state?.lastAuthEventId == result.eventId) {
+                state.lastAuthAccepted = result.accepted
+                state.lastAuthMessage = result.message
+                if (!result.accepted) {
+                    state.challenge = null
+                }
+                true
+            } else {
+                false
+            }
+        }
+        if (handledAuth) return
+        val requiresAuth = !result.accepted && result.code?.equals(AUTH_REQUIRED_CODE, ignoreCase = true) == true
+        if (requiresAuth) {
+            handleAuthRequired(relay, result)
+        }
+    }
+
+    private suspend fun handleAuthRequired(relay: String, result: PublishResult) {
+        var currentAttempts = 0
+        val hasPending = pendingMutex.withLock {
+            val pending = pendingRequests[result.eventId] as? PendingRequest ?: return@withLock false
+            val attempts = pending.relayAttempts[relay] ?: 0
+            if (attempts >= MAX_AUTH_RETRIES_PER_RELAY) {
+                false
+            } else {
+                currentAttempts = attempts
+                true
+            }
+        }
+        if (!hasPending) return
+
+        var resolvedRelayUrl = relay
+        val challenge = authMutex.withLock {
+            val state = relayAuthStates.getOrPut(relay) { RelayAuthState() }
+            resolvedRelayUrl = state.relayUrl ?: relay
+            val challengeValue = state.challenge
+            if (challengeValue == null) {
+                state.pendingRequestIds.add(result.eventId)
+            }
+            challengeValue
+        } ?: return
+
+        val authEvent = try {
+            Nip42Auth.buildAuthEvent(
+                signer = identity,
+                relayUrl = resolvedRelayUrl,
+                challenge = challenge
+            )
+        } catch (_: Throwable) {
+            return
+        }
+
+        try {
+            authMutex.withLock {
+                val state = relayAuthStates.getOrPut(relay) { RelayAuthState() }
+                state.lastAuthEventId = authEvent.id
+                state.lastAuthAccepted = null
+                state.lastAuthMessage = null
+            }
+            session.sessionRuntime().authenticate(relay, authEvent)
+        } catch (_: Throwable) {
+            authMutex.withLock {
+                relayAuthStates[relay]?.pendingRequestIds?.add(result.eventId)
+            }
+            return
+        }
+
+        pendingMutex.withLock {
+            (pendingRequests[result.eventId] as? PendingRequest)?.relayAttempts?.set(relay, currentAttempts + 1)
+        }
+        resendPendingRequests(relay, listOf(result.eventId))
+    }
+
+    private suspend fun resendPendingRequests(relay: String, requestIds: List<String>) {
+        for (requestId in requestIds) {
+            val event = pendingMutex.withLock {
+                (pendingRequests[requestId] as? PendingRequest)?.event
+            } ?: continue
+            runCatching { session.sessionRuntime().publishTo(relay, event) }
         }
     }
 

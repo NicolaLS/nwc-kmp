@@ -114,6 +114,14 @@ internal class NwcSessionRuntime(
         }
     }
 
+    suspend fun publishTo(relay: String, event: Event) {
+        sessions[relay]?.session?.publish(event)
+    }
+
+    suspend fun authenticate(relay: String, event: Event) {
+        sessions[relay]?.session?.authenticate(event)
+    }
+
     suspend fun shutdown() {
         shuttingDown = true
         reconnectJobs.values.forEach { it.cancel() }
