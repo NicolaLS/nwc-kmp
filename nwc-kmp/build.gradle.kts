@@ -1,4 +1,3 @@
-import org.gradle.api.JavaVersion
 import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 
 plugins {
@@ -32,25 +31,25 @@ kotlin {
     sourceSets {
         val commonMain by getting {
             dependencies {
-                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
-                implementation("io.github.nicolals:nostr-core:0.1.3-SNAPSHOT")
-                implementation("io.github.nicolals:nostr-codec-kotlinx-serialization:0.1.3-SNAPSHOT")
-                implementation("io.github.nicolals:nostr-runtime-coroutines:0.1.3-SNAPSHOT")
-                implementation("io.github.nicolals:nostr-transport-ktor:0.1.3-SNAPSHOT")
-                implementation("io.github.nicolals:nostr-crypto:0.1.3-SNAPSHOT")
-                implementation("io.github.nicolals:nip44:0.1.3-SNAPSHOT")
-                implementation("io.github.nicolals:nip04:0.1.3-SNAPSHOT")
-                implementation("io.github.nicolals:nip42:0.1.3-SNAPSHOT")
-                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
-                implementation("io.ktor:ktor-client-core:2.3.12")
-                implementation("io.ktor:ktor-client-websockets:2.3.12")
+                implementation(libs.kotlinx.coroutines.core)
+                implementation(libs.nostr.core)
+                implementation(libs.nostr.codec.kotlinx.serialization)
+                implementation(libs.nostr.runtime.coroutines)
+                implementation(libs.nostr.transport.ktor)
+                implementation(libs.nostr.crypto)
+                implementation(libs.nip44)
+                implementation(libs.nip04)
+                implementation(libs.nip42)
+                implementation(libs.kotlinx.serialization.json)
+                implementation(libs.ktor.client.core.v331)
+                implementation(libs.ktor.client.websockets.v331)
             }
         }
 
         val commonTest by getting {
             dependencies {
                 implementation(libs.kotlin.test)
-                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+                implementation(libs.kotlinx.coroutines.test)
             }
         }
 
