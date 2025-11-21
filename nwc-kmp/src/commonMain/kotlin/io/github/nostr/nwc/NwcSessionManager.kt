@@ -121,7 +121,7 @@ class NwcSessionManager private constructor(
             val managedScope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
             val ownsScope = scope == null
             val (client, ownsClient) = httpClient?.let { it to false } ?: run {
-                defaultNwcHttpClient() to true
+                defaultNwcHttpClient() to false
             }
             return NwcSessionManager(
                 scope = managedScope,
