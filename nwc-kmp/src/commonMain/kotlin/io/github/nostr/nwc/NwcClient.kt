@@ -43,7 +43,11 @@ import io.github.nostr.nwc.model.WalletNotification
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -100,6 +104,7 @@ private const val NOTIFICATION_KIND = 23197
 private const val AUTH_REQUIRED_CODE = "auth-required"
 private const val MAX_AUTH_RETRIES_PER_RELAY = 2
 const val DEFAULT_REQUEST_TIMEOUT_MS = 30_000L
+private const val NOTIFICATION_BUFFER_CAPACITY = 64
 
 class NwcClient private constructor(
     private val credentials: NwcCredentials,
@@ -111,7 +116,8 @@ class NwcClient private constructor(
     private val ownsHttpClient: Boolean,
     private val interceptors: List<NwcClientInterceptor>,
     private val initialMetadata: WalletMetadata?,
-    private val initialEncryption: EncryptionScheme?
+    private val initialEncryption: EncryptionScheme?,
+    private val useDirectResponseSubscriptions: Boolean
 ) : NwcClientContract {
 
     private val hasInterceptors = interceptors.isNotEmpty()
@@ -126,7 +132,8 @@ class NwcClient private constructor(
             requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS,
             cachedMetadata: WalletMetadata? = null,
             cachedEncryption: EncryptionScheme? = null,
-            interceptors: List<NwcClientInterceptor> = emptyList()
+            interceptors: List<NwcClientInterceptor> = emptyList(),
+            useDirectResponseSubscriptions: Boolean = false
         ): NwcClient {
             return create(
                 uri = NwcUri.parse(uri),
@@ -136,7 +143,8 @@ class NwcClient private constructor(
                 requestTimeoutMillis = requestTimeoutMillis,
                 cachedMetadata = cachedMetadata,
                 cachedEncryption = cachedEncryption,
-                interceptors = interceptors
+                interceptors = interceptors,
+                useDirectResponseSubscriptions = useDirectResponseSubscriptions
             )
         }
 
@@ -148,11 +156,12 @@ class NwcClient private constructor(
             requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS,
             cachedMetadata: WalletMetadata? = null,
             cachedEncryption: EncryptionScheme? = null,
-            interceptors: List<NwcClientInterceptor> = emptyList()
+            interceptors: List<NwcClientInterceptor> = emptyList(),
+            useDirectResponseSubscriptions: Boolean = false
         ): NwcClient {
             val credentials = uri.toCredentials()
             val (client, ownsClient) = httpClient?.let { it to false } ?: run {
-                defaultNwcHttpClient() to true
+                defaultNwcHttpClient() to false
             }
             val session = NwcSession.create(
                 credentials = credentials,
@@ -170,7 +179,8 @@ class NwcClient private constructor(
                 requestTimeoutMillis = requestTimeoutMillis,
                 cachedMetadata = cachedMetadata,
                 cachedEncryption = cachedEncryption,
-                interceptors = interceptors
+                interceptors = interceptors,
+                useDirectResponseSubscriptions = useDirectResponseSubscriptions
             )
         }
 
@@ -182,10 +192,11 @@ class NwcClient private constructor(
             requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS,
             cachedMetadata: WalletMetadata? = null,
             cachedEncryption: EncryptionScheme? = null,
-            interceptors: List<NwcClientInterceptor> = emptyList()
+            interceptors: List<NwcClientInterceptor> = emptyList(),
+            useDirectResponseSubscriptions: Boolean = false
         ): NwcClient {
             val (client, ownsClient) = httpClient?.let { it to false } ?: run {
-                defaultNwcHttpClient() to true
+                defaultNwcHttpClient() to false
             }
             val session = NwcSession.create(
                 credentials = credentials,
@@ -203,7 +214,8 @@ class NwcClient private constructor(
                 requestTimeoutMillis = requestTimeoutMillis,
                 cachedMetadata = cachedMetadata,
                 cachedEncryption = cachedEncryption,
-                interceptors = interceptors
+                interceptors = interceptors,
+                useDirectResponseSubscriptions = useDirectResponseSubscriptions
             )
         }
 
@@ -217,7 +229,8 @@ class NwcClient private constructor(
             requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS,
             cachedMetadata: WalletMetadata? = null,
             cachedEncryption: EncryptionScheme? = null,
-            interceptors: List<NwcClientInterceptor> = emptyList()
+            interceptors: List<NwcClientInterceptor> = emptyList(),
+            useDirectResponseSubscriptions: Boolean = false
         ): NwcClient {
             val client = NwcClient(
                 credentials = credentials,
@@ -229,7 +242,8 @@ class NwcClient private constructor(
                 ownsHttpClient = ownsHttpClient,
                 interceptors = interceptors,
                 initialMetadata = cachedMetadata,
-                initialEncryption = cachedEncryption
+                initialEncryption = cachedEncryption,
+                useDirectResponseSubscriptions = useDirectResponseSubscriptions
             )
             client.initialize()
             return client
@@ -296,6 +310,7 @@ class NwcClient private constructor(
 
     private val pendingMutex = Mutex()
     private val pendingRequests = mutableMapOf<String, PendingRequest>()
+    private val directResponseMutex = Mutex()
     private val directResponseSubscriptions = mutableMapOf<String, List<PendingResponseSubscription>>()
     private val directResponseLookup = mutableMapOf<String, String>()
 
@@ -305,7 +320,11 @@ class NwcClient private constructor(
     private val infoMutex = Mutex()
     private val infoSubscriptions = mutableMapOf<String, CompletableDeferred<Event?>>()
 
-    private val _notifications = MutableSharedFlow<WalletNotification>(replay = 0, extraBufferCapacity = 64)
+    private val _notifications = MutableSharedFlow<WalletNotification>(
+        replay = 0,
+        extraBufferCapacity = NOTIFICATION_BUFFER_CAPACITY,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
     override val notifications: SharedFlow<WalletNotification> = _notifications.asSharedFlow()
 
     private val walletMetadataState = MutableStateFlow<WalletMetadata?>(initialMetadata)
@@ -390,13 +409,16 @@ class NwcClient private constructor(
         runNwcCatching { refreshWalletMetadataInternal(timeoutMillis) }
 
     private suspend fun refreshWalletMetadataInternal(timeoutMillis: Long): WalletMetadata {
-        session.runtimeHandles.forEach { handle ->
-            val metadata = fetchMetadataFrom(handle, timeoutMillis)
-            if (metadata != null) {
-                walletMetadataState.value = metadata
-                updateActiveEncryption(metadata)
-                return metadata
-            }
+        val handles = session.runtimeHandles
+        val metadata = coroutineScope {
+            handles.map { handle ->
+                async { fetchMetadataFrom(handle, timeoutMillis) }
+            }.awaitAll().firstOrNull { it != null }
+        }
+        if (metadata != null) {
+            walletMetadataState.value = metadata
+            updateActiveEncryption(metadata)
+            return metadata
         }
         throw NwcException("Unable to fetch wallet metadata from configured relays.")
     }
@@ -951,9 +973,12 @@ class NwcClient private constructor(
 
     private suspend fun handleEvent(subscriptionId: SubscriptionId, event: Event) {
         val id = subscriptionId.value
-        directResponseLookup[id]?.let {
-            processResponseEvent(event)
-            return
+        if (useDirectResponseSubscriptions) {
+            val isDirect = directResponseMutex.withLock { directResponseLookup.containsKey(id) }
+            if (isDirect) {
+                processResponseEvent(event)
+                return
+            }
         }
         if (completeInfoRequest(id, event)) return
         when (id) {
@@ -1249,9 +1274,7 @@ class NwcClient private constructor(
         if (hasInterceptors) {
             interceptors.forEach { it.onNotification(notification) }
         }
-        if (!_notifications.tryEmit(notification)) {
-            scope.launch { _notifications.emit(notification) }
-        }
+        _notifications.tryEmit(notification)
     }
 
     private fun parseTransaction(source: JsonObject): Transaction {
@@ -1369,7 +1392,8 @@ class NwcClient private constructor(
     }
 
     private suspend fun ensureDirectResponseSubscription(eventId: String) {
-        if (directResponseSubscriptions.containsKey(eventId)) return
+        if (!useDirectResponseSubscriptions) return
+        if (directResponseMutex.withLock { directResponseSubscriptions.containsKey(eventId) }) return
         val handles = session.runtimeHandles
         if (handles.isEmpty()) return
         val filter = Filter(
@@ -1382,7 +1406,6 @@ class NwcClient private constructor(
             runCatching { handle.session.subscribe(subscriptionId, listOf(filter)) }
                 .onSuccess {
                     created += PendingResponseSubscription(handle, subscriptionId)
-                    directResponseLookup[subscriptionId] = eventId
                 }
                 .onFailure { failure ->
                     NwcLog.warn(logTag, failure) {
@@ -1391,13 +1414,19 @@ class NwcClient private constructor(
                 }
         }
         if (created.isNotEmpty()) {
-            directResponseSubscriptions[eventId] = created
+            directResponseMutex.withLock {
+                directResponseSubscriptions[eventId] = created
+                created.forEach { pending ->
+                    directResponseLookup[pending.subscriptionId] = eventId
+                }
+            }
             NwcLog.debug(logTag) { "Subscribed for direct response to event $eventId on ${created.size} session(s)" }
         }
     }
 
     private suspend fun unsubscribeDirectResponse(eventId: String) {
-        val subscriptions = directResponseSubscriptions.remove(eventId) ?: return
+        if (!useDirectResponseSubscriptions) return
+        val subscriptions = directResponseMutex.withLock { directResponseSubscriptions.remove(eventId) } ?: return
         subscriptions.forEach { subscription ->
             runCatching { subscription.handle.session.unsubscribe(subscription.subscriptionId) }
                 .onFailure { failure ->
@@ -1405,7 +1434,9 @@ class NwcClient private constructor(
                         "Failed to unsubscribe ${subscription.subscriptionId} from ${subscription.handle.url}"
                     }
                 }
-            directResponseLookup.remove(subscription.subscriptionId)
+            directResponseMutex.withLock {
+                directResponseLookup.remove(subscription.subscriptionId)
+            }
         }
     }
 

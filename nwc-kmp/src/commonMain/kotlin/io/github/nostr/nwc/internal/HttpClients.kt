@@ -20,14 +20,14 @@ internal object NwcHttpClients {
 
     fun build(): HttpClient = HttpClient {
         install(WebSockets) {
-	    pingIntervalMillis = DEFAULT_PING_INTERVAL_MS
+            pingIntervalMillis = DEFAULT_PING_INTERVAL_MS
             maxFrameSize = DEFAULT_MAX_FRAME_SIZE
         }
         install(HttpTimeout) {
             connectTimeoutMillis = DEFAULT_CONNECT_TIMEOUT_MS
             socketTimeoutMillis = DEFAULT_SOCKET_TIMEOUT_MS
             // The NWC protocol uses long-lived websockets; disable the generic request timeout.
-	    requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
+            requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
         }
     }
 }
