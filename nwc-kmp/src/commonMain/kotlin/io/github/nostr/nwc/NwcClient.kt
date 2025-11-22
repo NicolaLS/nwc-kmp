@@ -302,6 +302,9 @@ class NwcClient private constructor(
 
     private val pendingMutex = Mutex()
     private val pendingRequests = mutableMapOf<String, PendingRequest>()
+    private val directResponseMutex = Mutex()
+    private val directResponseSubscriptions = mutableMapOf<String, List<PendingResponseSubscription>>()
+    private val directResponseLookup = mutableMapOf<String, String>()
 
     private val authMutex = Mutex()
     private val relayAuthStates = mutableMapOf<String, RelayAuthState>()
@@ -319,20 +322,9 @@ class NwcClient private constructor(
     private val walletMetadataState = MutableStateFlow<WalletMetadata?>(initialMetadata)
     override val walletMetadata: StateFlow<WalletMetadata?> = walletMetadataState.asStateFlow()
 
-    private val responseFilters = listOf(
-        // Strict: wallet-authored responses addressed to this client (Alby, Coinos)
-        Filter(
-            kinds = setOf(RESPONSE_KIND),
-            authors = setOf(walletPublicKeyHex),
-            tags = mapOf("#$TAG_P" to setOf(clientPublicKeyHex))
-        ),
-        // Permissive: all wallet-authored responses (Primal - omits p tag)
-        // Safe because we only receive events from our wallet pubkey.
-        Filter(
-            kinds = setOf(RESPONSE_KIND),
-            authors = setOf(walletPublicKeyHex)
-        )
-    )
+    // No broad response filters - rely exclusively on per-request #e tag subscriptions
+    // for maximum efficiency and to avoid receiving/decrypting duplicate or foreign events.
+    private val responseFilters = emptyList<Filter>()
 
     private val notificationFilters = listOf(
         // Strict: wallet-authored notifications addressed to this client
@@ -724,8 +716,11 @@ class NwcClient private constructor(
             "Opening NWC session for ${credentials.walletPublicKeyHex} across ${credentials.relays.size} relay(s)"
         }
         session.open(handleOutput = ::handleOutput) { relaySession, _ ->
-            NwcLog.debug(logTag) { "Subscribing to response streams on relay ${relaySession.url}" }
-            relaySession.subscribe(SUBSCRIPTION_RESPONSES, responseFilters)
+            NwcLog.debug(logTag) { "Subscribing to notification stream on relay ${relaySession.url}" }
+            // No broad response subscription - rely on per-request #e tag subscriptions for efficiency
+            if (responseFilters.isNotEmpty()) {
+                relaySession.subscribe(SUBSCRIPTION_RESPONSES, responseFilters)
+            }
             relaySession.subscribe(SUBSCRIPTION_NOTIFICATIONS, notificationFilters)
         }
         if (walletMetadataState.value == null) {
@@ -784,11 +779,13 @@ class NwcClient private constructor(
         val event = buildRequestEvent(method, params, expirationSeconds)
         val deferred = CompletableDeferred<RawResponse>()
         registerPending(event.id, PendingRequest.Single(method, event, deferred))
+        ensureDirectResponseSubscription(event.id)
         try {
             NwcLog.debug(logTag) { "Publishing $method request as event ${event.id}" }
             publish(event)
         } catch (failure: Throwable) {
             NwcLog.error(logTag, failure) { "Failed to publish $method request event ${event.id}" }
+            unsubscribeDirectResponse(event.id)
             removePending(event.id, deferred)
             throw NwcException("Failed to publish request $method", failure)
         }
@@ -824,11 +821,13 @@ class NwcClient private constructor(
                 deferred = deferred
             )
         )
+        ensureDirectResponseSubscription(event.id)
         try {
             NwcLog.debug(logTag) { "Publishing multi request $method (event ${event.id}) expecting ${expectedKeys.size} keys" }
             publish(event)
         } catch (failure: Throwable) {
             NwcLog.error(logTag, failure) { "Failed to publish multi request $method event ${event.id}" }
+            unsubscribeDirectResponse(event.id)
             removePending(event.id, deferred)
             throw NwcException("Failed to publish multi request $method", failure)
         }
@@ -877,6 +876,9 @@ class NwcClient private constructor(
                     false
                 }
             }
+            if (removed) {
+                unsubscribeDirectResponse(requestId)
+            }
         }
 
     private suspend fun registerPending(requestId: String, pending: PendingRequest) {
@@ -886,7 +888,7 @@ class NwcClient private constructor(
     }
 
     private suspend fun removePending(requestId: String, deferred: CompletableDeferred<*>) {
-        pendingMutex.withLock {
+        val removed = pendingMutex.withLock {
             val current = pendingRequests[requestId]
             val matches = when {
                 current is PendingRequest.Single && current.deferred == deferred -> true
@@ -895,7 +897,13 @@ class NwcClient private constructor(
             }
             if (matches) {
                 pendingRequests.remove(requestId)
+                true
+            } else {
+                false
             }
+        }
+        if (removed) {
+            unsubscribeDirectResponse(requestId)
         }
     }
 
@@ -944,6 +952,11 @@ class NwcClient private constructor(
 
     private suspend fun handleEvent(subscriptionId: SubscriptionId, event: Event) {
         val id = subscriptionId.value
+        val isDirect = directResponseMutex.withLock { directResponseLookup.containsKey(id) }
+        if (isDirect) {
+            processResponseEvent(event)
+            return
+        }
         if (completeInfoRequest(id, event)) return
         when (id) {
             SUBSCRIPTION_RESPONSES -> processResponseEvent(event)
@@ -1151,6 +1164,7 @@ class NwcClient private constructor(
                 NwcLog.warn(logTag) { "Dropping response missing #e tag; no unambiguous pending request" }
                 return
             }
+        var shouldUnsubscribe = false
         pendingMutex.withLock {
             when (val pending = pendingRequests[requestId]) {
                 is PendingRequest.Single -> {
@@ -1159,6 +1173,7 @@ class NwcClient private constructor(
                         pending.deferred.complete(rawResponse)
                     }
                     pendingRequests.remove(requestId)
+                    shouldUnsubscribe = true
                 }
                 is PendingRequest.Multi -> {
                     val key = event.tagValue(TAG_D) ?: deriveMultiKey(rawResponse)
@@ -1168,11 +1183,15 @@ class NwcClient private constructor(
                             NwcLog.debug(logTag) { "Collected final multi response for event $requestId" }
                             pending.deferred.complete(pending.results.toMap())
                             pendingRequests.remove(requestId)
+                            shouldUnsubscribe = true
                         }
                     }
                 }
                 else -> Unit
             }
+        }
+        if (shouldUnsubscribe) {
+            unsubscribeDirectResponse(requestId)
         }
     }
 
@@ -1193,20 +1212,26 @@ class NwcClient private constructor(
     }
 
     private suspend fun completeRequestError(requestId: String, error: NwcError) {
+        var shouldUnsubscribe = false
         pendingMutex.withLock {
             when (val pending = pendingRequests.remove(requestId)) {
                 is PendingRequest.Single -> {
                     NwcLog.warn(logTag) { "Completing request $requestId with error ${error.code}" }
                     pending.deferred.complete(RawResponse("", null, error))
+                    shouldUnsubscribe = true
                 }
                 is PendingRequest.Multi -> {
                     NwcLog.warn(logTag) { "Completing multi request $requestId with error ${error.code}" }
                     pending.deferred.complete(
                         pending.expectedKeys.associateWith { RawResponse("", null, error) }
                     )
+                    shouldUnsubscribe = true
                 }
                 else -> Unit
             }
+        }
+        if (shouldUnsubscribe) {
+            unsubscribeDirectResponse(requestId)
         }
     }
 
@@ -1382,6 +1407,54 @@ class NwcClient private constructor(
         return bytes.toHexLower()
     }
 
+    private suspend fun ensureDirectResponseSubscription(eventId: String) {
+        if (directResponseMutex.withLock { directResponseSubscriptions.containsKey(eventId) }) return
+        val handles = session.runtimeHandles
+        if (handles.isEmpty()) return
+        val filter = Filter(
+            kinds = setOf(RESPONSE_KIND),
+            authors = setOf(walletPublicKeyHex),
+            tags = mapOf("#$TAG_E" to setOf(eventId))
+        )
+        val created = mutableListOf<PendingResponseSubscription>()
+        handles.forEach { handle ->
+            val subscriptionId = "nwc-response-${eventId.take(8)}-${randomId().take(6)}"
+            runCatching { handle.session.subscribe(subscriptionId, listOf(filter)) }
+                .onSuccess {
+                    created += PendingResponseSubscription(handle, subscriptionId)
+                }
+                .onFailure { failure ->
+                    NwcLog.warn(logTag, failure) {
+                        "Failed to create direct response subscription $subscriptionId on ${handle.url}"
+                    }
+                }
+        }
+        if (created.isNotEmpty()) {
+            directResponseMutex.withLock {
+                directResponseSubscriptions[eventId] = created
+                created.forEach { pending ->
+                    directResponseLookup[pending.subscriptionId] = eventId
+                }
+            }
+            NwcLog.debug(logTag) { "Subscribed for direct response to event $eventId on ${created.size} session(s)" }
+        }
+    }
+
+    private suspend fun unsubscribeDirectResponse(eventId: String) {
+        val subscriptions = directResponseMutex.withLock { directResponseSubscriptions.remove(eventId) } ?: return
+        subscriptions.forEach { subscription ->
+            runCatching { subscription.handle.session.unsubscribe(subscription.subscriptionId) }
+                .onFailure { failure ->
+                    NwcLog.warn(logTag, failure) {
+                        "Failed to unsubscribe ${subscription.subscriptionId} from ${subscription.handle.url}"
+                    }
+                }
+            directResponseMutex.withLock {
+                directResponseLookup.remove(subscription.subscriptionId)
+            }
+        }
+    }
+
     private data class NormalizedInvoiceItem(
         val id: String,
         val invoice: String,
@@ -1400,6 +1473,11 @@ class NwcClient private constructor(
     private data class ResolvedEncryption(
         val scheme: EncryptionScheme,
         val fromTag: Boolean
+    )
+
+    private data class PendingResponseSubscription(
+        val handle: NwcSessionRuntime.SessionHandle,
+        val subscriptionId: String
     )
 }
 
