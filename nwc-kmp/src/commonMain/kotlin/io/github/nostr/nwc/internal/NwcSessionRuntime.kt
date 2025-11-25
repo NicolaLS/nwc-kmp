@@ -11,7 +11,6 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
@@ -21,8 +20,6 @@ import nostr.codec.kotlinx.serialization.KotlinxSerializationWireCodec
 import nostr.core.model.Event
 import nostr.core.session.RelaySessionOutput
 import nostr.core.session.RelaySessionSettings
-import kotlin.math.pow
-import kotlin.random.Random
 import nostr.runtime.coroutines.RelaySessionManager
 import nostr.transport.ktor.KtorRelayConnectionFactory
 
@@ -55,12 +52,11 @@ internal class NwcSessionRuntime(
         connectionFactory = KtorRelayConnectionFactory(scope, httpClient),
         wireEncoder = wireCodec,
         wireDecoder = wireCodec,
-        sessionSettings = sessionSettings
+        sessionSettings = sessionSettings,
+        reconnectionPolicy = retryPolicy.toReconnectionPolicy()
     )
     private val sessions = mutableMapOf<String, RelaySession>()
     private val relayStates = MutableStateFlow<Map<String, RelayConnectionStatus>>(emptyMap())
-    private val reconnectJobs = mutableMapOf<String, Job>()
-    private val reconnectAttempts = mutableMapOf<String, Int>()
     private val sessionsMutex = kotlinx.coroutines.sync.Mutex()
     private val sessionHandlesState = MutableStateFlow<List<SessionHandle>>(emptyList())
     private var shuttingDown = false
@@ -141,15 +137,12 @@ internal class NwcSessionRuntime(
     suspend fun shutdown() {
         NwcLog.info(logTag) { "Shutting down session runtime" }
         shuttingDown = true
-        reconnectJobs.values.forEach { it.cancel() }
-        reconnectJobs.clear()
         val current = sessionsMutex.withLock {
             val snapshot = sessions.values.toList()
             sessions.clear()
             sessionHandlesState.value = emptyList()
             snapshot
         }
-        reconnectAttempts.clear()
         current.forEach { session ->
             session.outputsJob.cancelAndJoin()
             session.snapshotsJob.cancelAndJoin()
@@ -165,26 +158,6 @@ internal class NwcSessionRuntime(
         if (current[relay] == status) return
         NwcLog.debug(logTag) { "Relay $relay connection state -> $status" }
         relayStates.value = current + (relay to status)
-    }
-
-    private suspend fun scheduleReconnectIfNeeded(relay: String, snapshot: nostr.core.session.ConnectionSnapshot) {
-        if (!retryPolicy.enabled || shuttingDown) return
-        val shouldReconnect = when (snapshot) {
-            is nostr.core.session.ConnectionSnapshot.Failed -> true
-            is nostr.core.session.ConnectionSnapshot.Disconnected -> true
-            else -> false
-        }
-        if (!shouldReconnect) return
-        if (reconnectJobs[relay]?.isActive == true) return
-        val session = sessionsMutex.withLock { sessions[relay] } ?: return
-        val delayMillis = nextReconnectDelayMillis(relay)
-        reconnectJobs[relay] = scope.launch {
-            delay(delayMillis)
-            NwcLog.info(logTag) { "Reconnecting relay $relay after ${delayMillis}ms" }
-            kotlin.runCatching { session.session.connect() }
-                .onSuccess { reconnectAttempts[relay] = 0 }
-                .onFailure { NwcLog.warn(logTag, it) { "Reconnect attempt failed for relay $relay" } }
-        }
     }
 
     private suspend fun startRelay(
@@ -205,9 +178,6 @@ internal class NwcSessionRuntime(
             managed.connectionSnapshots.collect { snapshot ->
                 NwcLog.debug(logTag) { "Relay $relay snapshot ${snapshot::class.simpleName}" }
                 updateRelayState(relay, snapshot.toRelayStatus())
-                if (retryPolicy.enabled) {
-                    scheduleReconnectIfNeeded(relay, snapshot)
-                }
             }
         }
         val started = kotlin.runCatching {
@@ -218,31 +188,14 @@ internal class NwcSessionRuntime(
             NwcLog.error(logTag, started.exceptionOrNull()) { "Failed to start relay session for $relay" }
             snapshotsJob.cancel()
             outputsJob.cancel()
-            reconnectJobs.remove(relay)?.cancel()
             managed.release()
             throw started.exceptionOrNull()!!
         }
         NwcLog.info(logTag) { "Relay session established for $relay" }
-        reconnectAttempts[relay] = 0
         sessionsMutex.withLock {
             sessions[relay] = RelaySession(relay, managed, outputsJob, snapshotsJob)
             sessionHandlesState.value = sessions.values.map { it.handle }
         }
-    }
-
-    private fun nextReconnectDelayMillis(relay: String): Long {
-	val attempt = reconnectAttempts[relay] ?: 0
-        val base = retryPolicy.reconnectDelayMillis.coerceAtLeast(0L)
-        val multiplier = retryPolicy.backoffMultiplier.coerceAtLeast(1.0)
-        val maxDelay = retryPolicy.maxReconnectDelayMillis.coerceAtLeast(base)
-        val jitterRatio = retryPolicy.jitterRatio.coerceIn(0.0, 1.0)
-        val exponential = (base * multiplier.pow(attempt)).toLong().coerceAtMost(maxDelay)
-        val jitterSpread = (exponential * jitterRatio).toLong()
-        reconnectAttempts[relay] = attempt + 1
-        if (jitterSpread <= 0) return exponential
-        val min = (exponential - jitterSpread).coerceAtLeast(0L)
-        val max = exponential + jitterSpread
-        return Random.nextLong(min, max + 1)
     }
 
     private fun nostr.core.session.ConnectionSnapshot.toRelayStatus(): RelayConnectionStatus = when (this) {
