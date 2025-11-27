@@ -5,7 +5,7 @@ android-minSdk = "24"
 android-compileSdk = "36"
 ktorClientCore = "3.3.1"
 ktorClientWebsockets = "3.3.1"
-nostr-kmp = "0.1.7-SNAPSHOT"
+nostr-kmp = "0.1.0-SNAPSHOT"
 vanniktechMavenPublish = "0.34.0"
 kotlin-serialization = "1.9.0"
 kotlinx-coroutines = "1.10.2"
@@ -20,9 +20,9 @@ ktor-client-core-v331 = { module = "io.ktor:ktor-client-core", version.ref = "kt
 ktor-client-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor" }
 ktor-client-darwin = { module = "io.ktor:ktor-client-darwin", version.ref = "ktor" }
 ktor-client-websockets-v331 = { module = "io.ktor:ktor-client-websockets", version.ref = "ktorClientWebsockets" }
-nip04 = { module = "io.github.nicolals:nip04", version.ref = "nostr-kmp" }
-nip42 = { module = "io.github.nicolals:nip42", version.ref = "nostr-kmp" }
-nip44 = { module = "io.github.nicolals:nip44", version.ref = "nostr-kmp" }
+nip04 = { module = "io.github.nicolals:nostr-nip04", version.ref = "nostr-kmp" }
+nip42 = { module = "io.github.nicolals:nostr-nip42", version.ref = "nostr-kmp" }
+nip44 = { module = "io.github.nicolals:nostr-nip44", version.ref = "nostr-kmp" }
 nostr-codec-kotlinx-serialization = { module = "io.github.nicolals:nostr-codec-kotlinx-serialization", version.ref = "nostr-kmp" }
 nostr-core = { module = "io.github.nicolals:nostr-core", version.ref = "nostr-kmp" }
 nostr-crypto = { module = "io.github.nicolals:nostr-crypto", version.ref = "nostr-kmp" }
