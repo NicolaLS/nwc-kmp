@@ -145,6 +145,6 @@ All public APIs return `NwcResult`, exposing rich failure data without throwing.
 
 ### Bumping the Version
 
-- Edit `gradle.properties` and update the `VERSION_NAME` property. The file also carries the `GROUP`, `POM_ARTIFACT_ID`, and other publishing metadata used during publication.
+- Edit `build.gradle.kts` and update `versionName` (shared across all modules; `groupId` lives there too).
 - Follow semantic versioning. Use `-SNAPSHOT` while iterating; drop the suffix when cutting a real release.
 - After adjusting the version, re-run `./gradlew :nwc-kmp:publishToMavenLocal` so Maven consumers pick up the new artifact.

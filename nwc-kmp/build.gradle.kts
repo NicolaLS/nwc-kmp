@@ -6,9 +6,6 @@ plugins {
     alias(libs.plugins.vanniktech.mavenPublish)
 }
 
-group = property("GROUP") as String
-version = property("VERSION_NAME") as String
-
 
 kotlin {
     jvmToolchain(21)
@@ -82,38 +79,5 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
-    }
-}
-
-mavenPublishing {
-    publishToMavenCentral()
-
-    signAllPublications()
-
-    pom {
-        name = property("POM_NAME") as String
-        description = property("POM_DESCRIPTION") as String
-        inceptionYear = "2025"
-        url = property("POM_URL") as String
-        licenses {
-            license {
-                name = property("POM_LICENSE_NAME") as String
-                url = property("POM_LICENSE_URL") as String
-                distribution = property("POM_LICENSE_DIST") as String
-            }
-        }
-        developers {
-            developer {
-                id = property("POM_DEVELOPER_ID") as String
-                name = property("POM_DEVELOPER_NAME") as String
-                url = property("POM_DEVELOPER_URL") as String
-            }
-        }
-        scm {
-            val repoUrl = property("POM_URL") as String
-            url = repoUrl
-            connection = "scm:git:$repoUrl.git"
-            developerConnection = "scm:git:$repoUrl.git"
-        }
     }
 }
