@@ -37,231 +37,110 @@ class FakeNwcClient(
 ) : NwcClientContract {
 
     override val notifications: SharedFlow<WalletNotification>
-        get() = notificationsInternal.asSharedFlow()
+        get() = _notifications.asSharedFlow()
 
     override val walletMetadata: StateFlow<WalletMetadata?>
-        get() = walletMetadataInternal.asStateFlow()
+        get() = _walletMetadata.asStateFlow()
 
-    private val notificationsInternal = MutableSharedFlow<WalletNotification>(replay = 0, extraBufferCapacity = 16)
-    private val walletMetadataInternal = MutableStateFlow(initialMetadata)
+    private val _notifications = MutableSharedFlow<WalletNotification>(replay = 0, extraBufferCapacity = 16)
+    private val _walletMetadata = MutableStateFlow(initialMetadata)
 
-    val refreshWalletMetadataCalls = mutableListOf<Long>()
-    val getBalanceCalls = mutableListOf<Long>()
-    val getInfoCalls = mutableListOf<Long>()
-    val payInvoiceCalls = mutableListOf<PayInvoiceCall>()
-    val multiPayInvoiceCalls = mutableListOf<MultiPayInvoiceCall>()
-    val payKeysendCalls = mutableListOf<PayKeysendCall>()
-    val multiPayKeysendCalls = mutableListOf<MultiPayKeysendCall>()
-    val makeInvoiceCalls = mutableListOf<MakeInvoiceCall>()
-    val lookupInvoiceCalls = mutableListOf<LookupInvoiceCall>()
-    val listTransactionsCalls = mutableListOf<ListTransactionsCall>()
-    val describeWalletCalls = mutableListOf<Long>()
+    // Generic stub for methods that only take timeout
+    class TimeoutStub<R>(name: String) {
+        val calls = mutableListOf<Long>()
+        private val results = ArrayDeque<NwcResult<R>>()
+        var default: NwcResult<R> = NwcResult.Failure(NwcFailure.Unknown("FakeNwcClient: $name not stubbed"))
+
+        fun record(timeoutMillis: Long): NwcResult<R> {
+            calls += timeoutMillis
+            return results.removeFirstOrNull() ?: default
+        }
+
+        fun enqueue(result: NwcResult<R>) = results.addLast(result)
+        fun reset() { calls.clear(); results.clear() }
+    }
+
+    // Generic stub for methods with params
+    class ParamsStub<P, R>(name: String) {
+        val calls = mutableListOf<Pair<P, Long>>()
+        private val results = ArrayDeque<NwcResult<R>>()
+        var default: NwcResult<R> = NwcResult.Failure(NwcFailure.Unknown("FakeNwcClient: $name not stubbed"))
+
+        fun record(params: P, timeoutMillis: Long): NwcResult<R> {
+            calls += params to timeoutMillis
+            return results.removeFirstOrNull() ?: default
+        }
+
+        fun enqueue(result: NwcResult<R>) = results.addLast(result)
+        fun reset() { calls.clear(); results.clear() }
+    }
+
+    // Stubs for timeout-only methods
+    val refreshWalletMetadata = TimeoutStub<WalletMetadata>("refreshWalletMetadata")
+    val getBalance = TimeoutStub<BalanceResult>("getBalance")
+    val getInfo = TimeoutStub<GetInfoResult>("getInfo")
+    val describeWallet = TimeoutStub<NwcWalletDescriptor>("describeWallet")
+
+    // Stubs for parameterized methods
+    val payInvoice = ParamsStub<PayInvoiceParams, PayInvoiceResult>("payInvoice")
+    val multiPayInvoice = ParamsStub<List<MultiPayInvoiceItem>, Map<String, MultiResult<PayInvoiceResult>>>("multiPayInvoice")
+    val payKeysend = ParamsStub<KeysendParams, KeysendResult>("payKeysend")
+    val multiPayKeysend = ParamsStub<List<MultiKeysendItem>, Map<String, MultiResult<KeysendResult>>>("multiPayKeysend")
+    val makeInvoice = ParamsStub<MakeInvoiceParams, Transaction>("makeInvoice")
+    val lookupInvoice = ParamsStub<LookupInvoiceParams, Transaction>("lookupInvoice")
+    val listTransactions = ParamsStub<ListTransactionsParams, List<Transaction>>("listTransactions")
+
     var closeCount: Int = 0
         private set
 
-    private val refreshWalletMetadataResults = ArrayDeque<NwcResult<WalletMetadata>>()
-    private val getBalanceResults = ArrayDeque<NwcResult<BalanceResult>>()
-    private val getInfoResults = ArrayDeque<NwcResult<GetInfoResult>>()
-    private val payInvoiceResults = ArrayDeque<NwcResult<PayInvoiceResult>>()
-    private val multiPayInvoiceResults = ArrayDeque<NwcResult<Map<String, MultiResult<PayInvoiceResult>>>>()
-    private val payKeysendResults = ArrayDeque<NwcResult<KeysendResult>>()
-    private val multiPayKeysendResults = ArrayDeque<NwcResult<Map<String, MultiResult<KeysendResult>>>>()
-    private val makeInvoiceResults = ArrayDeque<NwcResult<Transaction>>()
-    private val lookupInvoiceResults = ArrayDeque<NwcResult<Transaction>>()
-    private val listTransactionsResults = ArrayDeque<NwcResult<List<Transaction>>>()
-    private val describeWalletResults = ArrayDeque<NwcResult<NwcWalletDescriptor>>()
-
-    var defaultRefreshWalletMetadataResult: NwcResult<WalletMetadata> = missingStub("refreshWalletMetadata")
-    var defaultGetBalanceResult: NwcResult<BalanceResult> = missingStub("getBalance")
-    var defaultGetInfoResult: NwcResult<GetInfoResult> = missingStub("getInfo")
-    var defaultPayInvoiceResult: NwcResult<PayInvoiceResult> = missingStub("payInvoice")
-    var defaultMultiPayInvoiceResult: NwcResult<Map<String, MultiResult<PayInvoiceResult>>> =
-        missingStub("multiPayInvoice")
-    var defaultPayKeysendResult: NwcResult<KeysendResult> = missingStub("payKeysend")
-    var defaultMultiPayKeysendResult: NwcResult<Map<String, MultiResult<KeysendResult>>> =
-        missingStub("multiPayKeysend")
-    var defaultMakeInvoiceResult: NwcResult<Transaction> = missingStub("makeInvoice")
-    var defaultLookupInvoiceResult: NwcResult<Transaction> = missingStub("lookupInvoice")
-    var defaultListTransactionsResult: NwcResult<List<Transaction>> = missingStub("listTransactions")
-    var defaultDescribeWalletResult: NwcResult<NwcWalletDescriptor> = missingStub("describeWallet")
-
     override suspend fun refreshWalletMetadata(timeoutMillis: Long): NwcResult<WalletMetadata> {
-        refreshWalletMetadataCalls += timeoutMillis
-        val result = nextResult(refreshWalletMetadataResults, defaultRefreshWalletMetadataResult)
-        if (result is NwcResult.Success) {
-            walletMetadataInternal.value = result.value
-        }
+        val result = refreshWalletMetadata.record(timeoutMillis)
+        if (result is NwcResult.Success) _walletMetadata.value = result.value
         return result
     }
 
-    override suspend fun getBalance(timeoutMillis: Long): NwcResult<BalanceResult> {
-        getBalanceCalls += timeoutMillis
-        return nextResult(getBalanceResults, defaultGetBalanceResult)
-    }
+    override suspend fun getBalance(timeoutMillis: Long) = getBalance.record(timeoutMillis)
+    override suspend fun getInfo(timeoutMillis: Long) = getInfo.record(timeoutMillis)
+    override suspend fun describeWallet(timeoutMillis: Long) = describeWallet.record(timeoutMillis)
 
-    override suspend fun getInfo(timeoutMillis: Long): NwcResult<GetInfoResult> {
-        getInfoCalls += timeoutMillis
-        return nextResult(getInfoResults, defaultGetInfoResult)
-    }
+    override suspend fun payInvoice(params: PayInvoiceParams, timeoutMillis: Long) =
+        payInvoice.record(params, timeoutMillis)
 
-    override suspend fun payInvoice(
-        params: PayInvoiceParams,
-        timeoutMillis: Long
-    ): NwcResult<PayInvoiceResult> {
-        payInvoiceCalls += PayInvoiceCall(params, timeoutMillis)
-        return nextResult(payInvoiceResults, defaultPayInvoiceResult)
-    }
+    override suspend fun multiPayInvoice(invoices: List<MultiPayInvoiceItem>, timeoutMillis: Long) =
+        multiPayInvoice.record(invoices.toList(), timeoutMillis)
 
-    override suspend fun multiPayInvoice(
-        invoices: List<MultiPayInvoiceItem>,
-        timeoutMillis: Long
-    ): NwcResult<Map<String, MultiResult<PayInvoiceResult>>> {
-        multiPayInvoiceCalls += MultiPayInvoiceCall(invoices.toList(), timeoutMillis)
-        return nextResult(multiPayInvoiceResults, defaultMultiPayInvoiceResult)
-    }
+    override suspend fun payKeysend(params: KeysendParams, timeoutMillis: Long) =
+        payKeysend.record(params, timeoutMillis)
 
-    override suspend fun payKeysend(
-        params: KeysendParams,
-        timeoutMillis: Long
-    ): NwcResult<KeysendResult> {
-        payKeysendCalls += PayKeysendCall(params, timeoutMillis)
-        return nextResult(payKeysendResults, defaultPayKeysendResult)
-    }
+    override suspend fun multiPayKeysend(items: List<MultiKeysendItem>, timeoutMillis: Long) =
+        multiPayKeysend.record(items.toList(), timeoutMillis)
 
-    override suspend fun multiPayKeysend(
-        items: List<MultiKeysendItem>,
-        timeoutMillis: Long
-    ): NwcResult<Map<String, MultiResult<KeysendResult>>> {
-        multiPayKeysendCalls += MultiPayKeysendCall(items.toList(), timeoutMillis)
-        return nextResult(multiPayKeysendResults, defaultMultiPayKeysendResult)
-    }
+    override suspend fun makeInvoice(params: MakeInvoiceParams, timeoutMillis: Long) =
+        makeInvoice.record(params, timeoutMillis)
 
-    override suspend fun makeInvoice(
-        params: MakeInvoiceParams,
-        timeoutMillis: Long
-    ): NwcResult<Transaction> {
-        makeInvoiceCalls += MakeInvoiceCall(params, timeoutMillis)
-        return nextResult(makeInvoiceResults, defaultMakeInvoiceResult)
-    }
+    override suspend fun lookupInvoice(params: LookupInvoiceParams, timeoutMillis: Long) =
+        lookupInvoice.record(params, timeoutMillis)
 
-    override suspend fun lookupInvoice(
-        params: LookupInvoiceParams,
-        timeoutMillis: Long
-    ): NwcResult<Transaction> {
-        lookupInvoiceCalls += LookupInvoiceCall(params, timeoutMillis)
-        return nextResult(lookupInvoiceResults, defaultLookupInvoiceResult)
-    }
+    override suspend fun listTransactions(params: ListTransactionsParams, timeoutMillis: Long) =
+        listTransactions.record(params, timeoutMillis)
 
-    override suspend fun listTransactions(
-        params: ListTransactionsParams,
-        timeoutMillis: Long
-    ): NwcResult<List<Transaction>> {
-        listTransactionsCalls += ListTransactionsCall(params, timeoutMillis)
-        return nextResult(listTransactionsResults, defaultListTransactionsResult)
-    }
+    override suspend fun close() { closeCount++ }
 
-    override suspend fun describeWallet(timeoutMillis: Long): NwcResult<NwcWalletDescriptor> {
-        describeWalletCalls += timeoutMillis
-        return nextResult(describeWalletResults, defaultDescribeWalletResult)
-    }
+    suspend fun emitNotification(notification: WalletNotification) = _notifications.emit(notification)
+    fun tryEmitNotification(notification: WalletNotification) = _notifications.tryEmit(notification)
 
-    override suspend fun close() {
-        closeCount += 1
-    }
-
-    suspend fun emitNotification(notification: WalletNotification) {
-        notificationsInternal.emit(notification)
-    }
-
-    fun tryEmitNotification(notification: WalletNotification): Boolean =
-        notificationsInternal.tryEmit(notification)
-
-    fun enqueueRefreshWalletMetadataResult(result: NwcResult<WalletMetadata>) {
-        refreshWalletMetadataResults.addLast(result)
-    }
-
-    fun enqueueGetBalanceResult(result: NwcResult<BalanceResult>) {
-        getBalanceResults.addLast(result)
-    }
-
-    fun enqueueGetInfoResult(result: NwcResult<GetInfoResult>) {
-        getInfoResults.addLast(result)
-    }
-
-    fun enqueuePayInvoiceResult(result: NwcResult<PayInvoiceResult>) {
-        payInvoiceResults.addLast(result)
-    }
-
-    fun enqueueMultiPayInvoiceResult(result: NwcResult<Map<String, MultiResult<PayInvoiceResult>>>) {
-        multiPayInvoiceResults.addLast(result)
-    }
-
-    fun enqueuePayKeysendResult(result: NwcResult<KeysendResult>) {
-        payKeysendResults.addLast(result)
-    }
-
-    fun enqueueMultiPayKeysendResult(result: NwcResult<Map<String, MultiResult<KeysendResult>>>) {
-        multiPayKeysendResults.addLast(result)
-    }
-
-    fun enqueueMakeInvoiceResult(result: NwcResult<Transaction>) {
-        makeInvoiceResults.addLast(result)
-    }
-
-    fun enqueueLookupInvoiceResult(result: NwcResult<Transaction>) {
-        lookupInvoiceResults.addLast(result)
-    }
-
-    fun enqueueListTransactionsResult(result: NwcResult<List<Transaction>>) {
-        listTransactionsResults.addLast(result)
-    }
-
-    fun enqueueDescribeWalletResult(result: NwcResult<NwcWalletDescriptor>) {
-        describeWalletResults.addLast(result)
-    }
-
-    fun resetQueues() {
-        refreshWalletMetadataResults.clear()
-        getBalanceResults.clear()
-        getInfoResults.clear()
-        payInvoiceResults.clear()
-        multiPayInvoiceResults.clear()
-        payKeysendResults.clear()
-        multiPayKeysendResults.clear()
-        makeInvoiceResults.clear()
-        lookupInvoiceResults.clear()
-        listTransactionsResults.clear()
-        describeWalletResults.clear()
-    }
-
-    fun resetCalls() {
-        refreshWalletMetadataCalls.clear()
-        getBalanceCalls.clear()
-        getInfoCalls.clear()
-        payInvoiceCalls.clear()
-        multiPayInvoiceCalls.clear()
-        payKeysendCalls.clear()
-        multiPayKeysendCalls.clear()
-        makeInvoiceCalls.clear()
-        lookupInvoiceCalls.clear()
-        listTransactionsCalls.clear()
-        describeWalletCalls.clear()
+    fun reset() {
+        refreshWalletMetadata.reset()
+        getBalance.reset()
+        getInfo.reset()
+        describeWallet.reset()
+        payInvoice.reset()
+        multiPayInvoice.reset()
+        payKeysend.reset()
+        multiPayKeysend.reset()
+        makeInvoice.reset()
+        lookupInvoice.reset()
+        listTransactions.reset()
         closeCount = 0
     }
-
-    private fun <T> nextResult(
-        queue: ArrayDeque<NwcResult<T>>,
-        fallback: NwcResult<T>
-    ): NwcResult<T> = if (queue.isNotEmpty()) queue.removeFirst() else fallback
-
-    private fun <T> missingStub(method: String): NwcResult<T> =
-        NwcResult.Failure(NwcFailure.Unknown("FakeNwcClient: $method not stubbed"))
-
-    data class PayInvoiceCall(val params: PayInvoiceParams, val timeoutMillis: Long)
-    data class MultiPayInvoiceCall(val invoices: List<MultiPayInvoiceItem>, val timeoutMillis: Long)
-    data class PayKeysendCall(val params: KeysendParams, val timeoutMillis: Long)
-    data class MultiPayKeysendCall(val items: List<MultiKeysendItem>, val timeoutMillis: Long)
-    data class MakeInvoiceCall(val params: MakeInvoiceParams, val timeoutMillis: Long)
-    data class LookupInvoiceCall(val params: LookupInvoiceParams, val timeoutMillis: Long)
-    data class ListTransactionsCall(val params: ListTransactionsParams, val timeoutMillis: Long)
 }

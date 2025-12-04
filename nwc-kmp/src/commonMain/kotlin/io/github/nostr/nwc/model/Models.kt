@@ -33,9 +33,11 @@ data class PayInvoiceResult(
 
 typealias KeysendResult = PayInvoiceResult
 
-enum class TransactionType {
-    INCOMING,
-    OUTGOING;
+enum class TransactionType(val wireName: String) {
+    INCOMING("incoming"),
+    OUTGOING("outgoing");
+
+    fun toWire(): String = wireName
 
     companion object {
         fun fromWire(value: String?): TransactionType? = when (value?.lowercase()) {

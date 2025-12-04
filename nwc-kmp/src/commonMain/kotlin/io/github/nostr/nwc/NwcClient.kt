@@ -10,7 +10,13 @@ import io.github.nostr.nwc.internal.TAG_ENCRYPTION
 import io.github.nostr.nwc.internal.TAG_EXPIRATION
 import io.github.nostr.nwc.internal.TAG_P
 import io.github.nostr.nwc.internal.asString
+import io.github.nostr.nwc.internal.decodeRawResponse
 import io.github.nostr.nwc.internal.defaultNwcHttpClient
+import io.github.nostr.nwc.internal.parseNwcError
+import io.github.nostr.nwc.internal.parseTransaction
+import io.github.nostr.nwc.internal.parseWalletMetadata
+import io.github.nostr.nwc.internal.tagValue
+import io.github.nostr.nwc.internal.tagValues
 import io.github.nostr.nwc.logging.NwcLog
 import io.github.nostr.nwc.model.BalanceResult
 import io.github.nostr.nwc.model.BitcoinAmount
@@ -37,15 +43,17 @@ import io.github.nostr.nwc.model.Transaction
 import io.github.nostr.nwc.model.TransactionState
 import io.github.nostr.nwc.model.TransactionType
 import io.github.nostr.nwc.model.WalletMetadata
-import io.github.nicolals.nostr.nips.nip42.Nip42Auth
 import io.github.nostr.nwc.model.RawResponse
 import io.github.nostr.nwc.model.WalletNotification
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -54,10 +62,14 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import nostr.runtime.coroutines.EagerRetryConfig
+import nostr.runtime.coroutines.RequestResult
+import nostr.runtime.coroutines.getOrNull
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -65,6 +77,7 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.jsonPrimitive
@@ -85,8 +98,11 @@ import decryptWithSharedSecret as nip04DecryptWithSharedSecret
 import deriveSharedSecret as nip04DeriveSharedSecret
 import encryptWithSharedSecret as nip04EncryptWithSharedSecret
 import kotlin.random.Random
+import kotlin.time.TimeSource
 import nostr.core.utils.toHexLower
 import io.github.nostr.nwc.internal.NwcSessionRuntime
+import io.github.nostr.nwc.internal.PendingRequestManager
+import io.github.nostr.nwc.internal.PendingRequestManager.PendingRequest
 import io.github.nostr.nwc.internal.json
 import io.github.nostr.nwc.internal.jsonArrayOrNull
 import io.github.nostr.nwc.internal.jsonObjectOrNull
@@ -101,10 +117,25 @@ private const val INFO_EVENT_KIND = 13194
 private const val REQUEST_KIND = 23194
 private const val RESPONSE_KIND = 23195
 private const val NOTIFICATION_KIND = 23197
-private const val AUTH_REQUIRED_CODE = "auth-required"
-private const val MAX_AUTH_RETRIES_PER_RELAY = 2
 const val DEFAULT_REQUEST_TIMEOUT_MS = 30_000L
 private const val NOTIFICATION_BUFFER_CAPACITY = 64
+
+/**
+ * Retry config for NWC foreground operations.
+ * - staleTimeoutThreshold=1: Single timeout while connected triggers reconnect (aggressive stale detection)
+ * - maxRetries=1: One retry after stale detection (we race relays, so per-relay retries are limited)
+ * - writeTimeoutMillis=3000: Await write confirmation to detect dead connections fast
+ * - checkNetworkBeforeRequest=true: Fail immediately if device is offline
+ */
+private val NwcRetryConfig = EagerRetryConfig(
+    maxRetries = 1,
+    staleTimeoutThreshold = 1,
+    writeTimeoutMillis = 3000,
+    checkNetworkBeforeRequest = true
+)
+
+/** Timeout for subscription setup per relay during initialization */
+private const val SUBSCRIPTION_SETUP_TIMEOUT_MS = 5_000L
 
 class NwcClient private constructor(
     private val credentials: NwcCredentials,
@@ -122,8 +153,49 @@ class NwcClient private constructor(
     private val hasInterceptors = interceptors.isNotEmpty()
     private val logTag = "NwcClient"
 
+    /**
+     * Initialization state machine for background initialization.
+     * Tracks progress of session setup and subscription creation.
+     */
+    private sealed class InitState {
+        /** Initial state before initialization starts */
+        data object NotStarted : InitState()
+
+        /** Initialization is in progress */
+        data object Initializing : InitState()
+
+        /** All relays are ready */
+        data class Ready(val readyRelays: Set<String>) : InitState()
+
+        /** Some relays are ready, others are pending recovery */
+        data class PartialReady(
+            val readyRelays: Set<String>,
+            val pendingRelays: Set<String>
+        ) : InitState()
+
+        /** Initialization failed completely */
+        data class Failed(val error: Throwable) : InitState()
+    }
+
+    private val initState = MutableStateFlow<InitState>(InitState.NotStarted)
+    private var initJob: Job? = null
+    private var recoveryJob: Job? = null
+
     companion object {
-        suspend fun create(
+        /**
+         * Creates an NwcClient from a NWC URI string.
+         * Returns immediately - initialization happens in background.
+         *
+         * @param uri NWC connection URI string (nostr+walletconnect://...)
+         * @param scope CoroutineScope for background operations
+         * @param httpClient Optional HTTP client for relay connections (created internally if null)
+         * @param sessionSettings Relay session configuration
+         * @param requestTimeoutMillis Default timeout for wallet requests
+         * @param cachedMetadata Cached wallet metadata to avoid initial fetch
+         * @param cachedEncryption Cached encryption scheme preference
+         * @param interceptors Request/response observers
+         */
+        fun create(
             uri: String,
             scope: CoroutineScope,
             httpClient: HttpClient? = null,
@@ -132,20 +204,17 @@ class NwcClient private constructor(
             cachedMetadata: WalletMetadata? = null,
             cachedEncryption: EncryptionScheme? = null,
             interceptors: List<NwcClientInterceptor> = emptyList()
-        ): NwcClient {
-            return create(
-                uri = NwcUri.parse(uri),
-                scope = scope,
-                httpClient = httpClient,
-                sessionSettings = sessionSettings,
-                requestTimeoutMillis = requestTimeoutMillis,
-                cachedMetadata = cachedMetadata,
-                cachedEncryption = cachedEncryption,
-                interceptors = interceptors
-            )
-        }
+        ): NwcClient = create(
+            NwcUri.parse(uri).toCredentials(),
+            scope, httpClient, sessionSettings, requestTimeoutMillis,
+            cachedMetadata, cachedEncryption, interceptors
+        )
 
-        suspend fun create(
+        /**
+         * Creates an NwcClient from a parsed NwcUri.
+         * Returns immediately - initialization happens in background.
+         */
+        fun create(
             uri: NwcUri,
             scope: CoroutineScope,
             httpClient: HttpClient? = null,
@@ -154,32 +223,20 @@ class NwcClient private constructor(
             cachedMetadata: WalletMetadata? = null,
             cachedEncryption: EncryptionScheme? = null,
             interceptors: List<NwcClientInterceptor> = emptyList()
-        ): NwcClient {
-            val credentials = uri.toCredentials()
-            val (client, ownsClient) = httpClient?.let { it to false } ?: run {
-                defaultNwcHttpClient() to false
-            }
-            val session = NwcSession.create(
-                credentials = credentials,
-                scope = scope,
-                httpClient = client,
-                sessionSettings = sessionSettings
-            )
-            return create(
-                credentials = credentials,
-                scope = scope,
-                session = session,
-                ownsSession = true,
-                httpClient = client,
-                ownsHttpClient = ownsClient,
-                requestTimeoutMillis = requestTimeoutMillis,
-                cachedMetadata = cachedMetadata,
-                cachedEncryption = cachedEncryption,
-                interceptors = interceptors
-            )
-        }
+        ): NwcClient = create(
+            uri.toCredentials(),
+            scope, httpClient, sessionSettings, requestTimeoutMillis,
+            cachedMetadata, cachedEncryption, interceptors
+        )
 
-        suspend fun create(
+        /**
+         * Creates an NwcClient from NwcCredentials.
+         * Returns immediately - initialization happens in background.
+         *
+         * This is the primary factory method. It creates the HTTP client and session
+         * internally if not provided, and starts background initialization.
+         */
+        fun create(
             credentials: NwcCredentials,
             scope: CoroutineScope,
             httpClient: HttpClient? = null,
@@ -189,88 +246,56 @@ class NwcClient private constructor(
             cachedEncryption: EncryptionScheme? = null,
             interceptors: List<NwcClientInterceptor> = emptyList()
         ): NwcClient {
-            val (client, ownsClient) = httpClient?.let { it to false } ?: run {
-                defaultNwcHttpClient() to false
-            }
+            val client = httpClient ?: defaultNwcHttpClient()
             val session = NwcSession.create(
                 credentials = credentials,
                 scope = scope,
                 httpClient = client,
                 sessionSettings = sessionSettings
             )
-            return create(
+            return NwcClient(
                 credentials = credentials,
                 scope = scope,
+                requestTimeoutMillis = requestTimeoutMillis,
                 session = session,
                 ownsSession = true,
                 httpClient = client,
-                ownsHttpClient = ownsClient,
-                requestTimeoutMillis = requestTimeoutMillis,
-                cachedMetadata = cachedMetadata,
-                cachedEncryption = cachedEncryption,
-                interceptors = interceptors
-            )
+                ownsHttpClient = false, // Never own shared client; user-provided clients are their responsibility
+                interceptors = interceptors,
+                initialMetadata = cachedMetadata,
+                initialEncryption = cachedEncryption
+            ).also { it.startBackgroundInit() }
         }
 
-        suspend fun create(
-            credentials: NwcCredentials,
-            scope: CoroutineScope,
+        /**
+         * Creates an NwcClient that reuses an existing session.
+         * The caller retains ownership of the session and is responsible for closing it.
+         *
+         * @param session An existing NwcSession to reuse
+         * @param requestTimeoutMillis Default timeout for wallet requests
+         * @param cachedMetadata Cached wallet metadata to avoid initial fetch
+         * @param cachedEncryption Cached encryption scheme preference
+         * @param interceptors Request/response observers
+         */
+        fun createWithSession(
             session: NwcSession,
-            ownsSession: Boolean,
-            httpClient: HttpClient,
-            ownsHttpClient: Boolean = false,
             requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS,
             cachedMetadata: WalletMetadata? = null,
             cachedEncryption: EncryptionScheme? = null,
             interceptors: List<NwcClientInterceptor> = emptyList()
-        ): NwcClient {
-            val client = NwcClient(
-                credentials = credentials,
-                scope = scope,
-                requestTimeoutMillis = requestTimeoutMillis,
-                session = session,
-                ownsSession = ownsSession,
-                httpClient = httpClient,
-                ownsHttpClient = ownsHttpClient,
-                interceptors = interceptors,
-                initialMetadata = cachedMetadata,
-                initialEncryption = cachedEncryption
-            )
-            client.initialize()
-            return client
-        }
+        ): NwcClient = NwcClient(
+            credentials = session.credentials,
+            scope = session.coroutineScope,
+            requestTimeoutMillis = requestTimeoutMillis,
+            session = session,
+            ownsSession = false,
+            httpClient = session.httpClientInternal,
+            ownsHttpClient = false,
+            interceptors = interceptors,
+            initialMetadata = cachedMetadata,
+            initialEncryption = cachedEncryption
+        ).also { it.startBackgroundInit() }
     }
-
-    private sealed interface PendingRequest {
-        val method: String
-        val event: Event
-        val relayAttempts: MutableMap<String, Int>
-
-        class Single(
-            override val method: String,
-            override val event: Event,
-            val deferred: CompletableDeferred<RawResponse>,
-            override val relayAttempts: MutableMap<String, Int> = mutableMapOf()
-        ) : PendingRequest
-
-        class Multi(
-            override val method: String,
-            override val event: Event,
-            val expectedKeys: Set<String>,
-            val results: MutableMap<String, RawResponse>,
-            val deferred: CompletableDeferred<Map<String, RawResponse>>,
-            override val relayAttempts: MutableMap<String, Int> = mutableMapOf()
-        ) : PendingRequest
-    }
-
-    private data class RelayAuthState(
-        var relayUrl: String? = null,
-        var challenge: String? = null,
-        var lastAuthEventId: String? = null,
-        var lastAuthAccepted: Boolean? = null,
-        var lastAuthMessage: String? = null,
-        val pendingRequestIds: MutableSet<String> = mutableSetOf()
-    )
 
     private val identity: Identity = SecpIdentity.fromPrivateKey(credentials.secretKey)
     private val clientPublicKeyHex: String = identity.publicKey.toString()
@@ -300,17 +325,7 @@ class NwcClient private constructor(
             EncryptionScheme.Nip44V2
         }
 
-    private val pendingMutex = Mutex()
-    private val pendingRequests = mutableMapOf<String, PendingRequest>()
-    private val directResponseMutex = Mutex()
-    private val directResponseSubscriptions = mutableMapOf<String, List<PendingResponseSubscription>>()
-    private val directResponseLookup = mutableMapOf<String, String>()
-
-    private val authMutex = Mutex()
-    private val relayAuthStates = mutableMapOf<String, RelayAuthState>()
-
-    private val infoMutex = Mutex()
-    private val infoSubscriptions = mutableMapOf<String, CompletableDeferred<Event?>>()
+    private val pendingRequestManager = PendingRequestManager(logTag)
 
     private val _notifications = MutableSharedFlow<WalletNotification>(
         replay = 0,
@@ -321,10 +336,6 @@ class NwcClient private constructor(
 
     private val walletMetadataState = MutableStateFlow<WalletMetadata?>(initialMetadata)
     override val walletMetadata: StateFlow<WalletMetadata?> = walletMetadataState.asStateFlow()
-
-    // No broad response filters - rely exclusively on per-request #e tag subscriptions
-    // for maximum efficiency and to avoid receiving/decrypting duplicate or foreign events.
-    private val responseFilters = emptyList<Filter>()
 
     private val notificationFilters = listOf(
         // Strict: wallet-authored notifications addressed to this client
@@ -354,22 +365,7 @@ class NwcClient private constructor(
     }
 
     override suspend fun close() {
-        pendingMutex.withLock {
-            pendingRequests.values.forEach { request ->
-                when (request) {
-                    is PendingRequest.Single -> request.deferred.cancel()
-                    is PendingRequest.Multi -> request.deferred.cancel()
-                }
-            }
-            pendingRequests.clear()
-        }
-        infoMutex.withLock {
-            infoSubscriptions.values.forEach { it.cancel() }
-            infoSubscriptions.clear()
-        }
-        authMutex.withLock {
-            relayAuthStates.clear()
-        }
+        pendingRequestManager.cancelAll()
         if (ownsSession) {
             session.close()
         }
@@ -382,11 +378,25 @@ class NwcClient private constructor(
         runNwcCatching { refreshWalletMetadataInternal(timeoutMillis) }
 
     private suspend fun refreshWalletMetadataInternal(timeoutMillis: Long): WalletMetadata {
+        // Wait for initialization to complete before accessing handles
+        awaitReady(timeoutMillis)
         val handles = session.runtimeHandles
         val metadata = coroutineScope {
-            handles.map { handle ->
-                async { fetchMetadataFrom(handle, timeoutMillis) }
-            }.awaitAll().firstOrNull { it != null }
+            val result = CompletableDeferred<WalletMetadata?>()
+            val jobs = handles.map { handle ->
+                async {
+                    val value = fetchMetadataFrom(handle, timeoutMillis)
+                    if (value != null) result.complete(value)
+                    value
+                }
+            }
+            launch {
+                jobs.joinAll()
+                result.complete(null)
+            }
+            val winner = result.await()
+            if (winner != null) jobs.forEach { it.cancel() }
+            winner
         }
         if (metadata != null) {
             walletMetadataState.value = metadata
@@ -396,101 +406,113 @@ class NwcClient private constructor(
         throw NwcException("Unable to fetch wallet metadata from configured relays.")
     }
 
-    override suspend fun getBalance(timeoutMillis: Long): NwcResult<BalanceResult> =
-        runNwcCatching { getBalanceInternal(timeoutMillis) }
+    // ==================== Generic Request Helpers ====================
 
-    private suspend fun getBalanceInternal(timeoutMillis: Long): BalanceResult {
-        val params = buildJsonObject { }
-        val response = sendSingleRequest(MethodNames.GET_BALANCE, params, timeoutMillis)
-        val jsonResult = response.result as? JsonObject
-            ?: throw NwcProtocolException("get_balance response missing result object")
-        val balanceMsats = jsonResult["balance"]?.jsonPrimitive?.longValueOrNull()
-            ?: throw NwcProtocolException("get_balance response missing balance")
-        return BalanceResult(BitcoinAmount.fromMsats(balanceMsats))
+    /**
+     * Generic single-request executor that handles the common pattern:
+     * build params → send request → parse JSON object result.
+     */
+    private suspend inline fun <R> execute(
+        method: String,
+        timeoutMillis: Long,
+        buildParams: JsonObjectBuilder.() -> Unit = {},
+        parseResult: (JsonObject) -> R
+    ): R {
+        val params = buildJsonObject(buildParams)
+        val response = sendSingleRequest(method, params, timeoutMillis)
+        val obj = response.result as? JsonObject
+            ?: throw NwcProtocolException("$method response missing result object")
+        return parseResult(obj)
     }
 
-    override suspend fun getInfo(timeoutMillis: Long): NwcResult<GetInfoResult> =
-        runNwcCatching { getInfoInternal(timeoutMillis) }
-
-    private suspend fun getInfoInternal(timeoutMillis: Long): GetInfoResult {
-        val params = buildJsonObject { }
-        val response = sendSingleRequest(MethodNames.GET_INFO, params, timeoutMillis)
-        val obj = response.result as? JsonObject
-            ?: throw NwcProtocolException("get_info response missing result object")
-        val rawPubkey = obj.string("pubkey")
-        val pubkey = if (rawPubkey.isNullOrBlank()) {
-            NwcLog.warn(logTag) {
-                "get_info response missing pubkey, defaulting to wallet credential pubkey ${credentials.walletPublicKeyHex}"
+    /**
+     * Generic multi-request executor that handles the common pattern:
+     * send multi-request → parse each response → return map of results.
+     */
+    private suspend inline fun <R> executeMultiRequest(
+        method: String,
+        params: JsonObject,
+        expectedKeys: Set<String>,
+        timeoutMillis: Long,
+        parseResult: (JsonObject) -> R
+    ): Map<String, MultiResult<R>> {
+        val responses = sendMultiRequest(method, params, expectedKeys, timeoutMillis)
+        return responses.mapValues { (key, raw) ->
+            raw.error?.let { MultiResult.Failure(it) } ?: run {
+                val obj = raw.result as? JsonObject
+                    ?: return@mapValues MultiResult.Failure(
+                        NwcError("INVALID_RESULT", "Missing result for $method entry $key")
+                    )
+                runCatching { MultiResult.Success(parseResult(obj)) }.getOrElse { e ->
+                    MultiResult.Failure(NwcError("PARSE_ERROR", e.message ?: "Failed to parse $method result"))
+                }
             }
-            credentials.walletPublicKeyHex
-        } else {
-            rawPubkey
         }
-        val network = Network.fromWire(obj.string("network"))
-        val methods = obj.jsonArrayOrNull("methods")
-            ?.mapNotNull { NwcCapability.fromWire(it.asString()) }
-            ?.toSet()
-            ?: emptySet()
-        val notifications = obj.jsonArrayOrNull("notifications")
-            ?.mapNotNull { NwcNotificationType.fromWire(it.asString()) }
-            ?.toSet()
-            ?: emptySet()
-        return GetInfoResult(
-            alias = obj.string("alias"),
-            color = obj.string("color"),
-            pubkey = pubkey,
-            network = network,
-            blockHeight = obj["block_height"]?.jsonPrimitive?.longValueOrNull(),
-            blockHash = obj.string("block_hash"),
-            methods = methods,
-            notifications = notifications
-        )
+    }
+
+    // ==================== API Methods ====================
+
+    override suspend fun getBalance(timeoutMillis: Long): NwcResult<BalanceResult> = runNwcCatching {
+        execute(MethodNames.GET_BALANCE, timeoutMillis) { obj ->
+            val balanceMsats = obj["balance"]?.jsonPrimitive?.longValueOrNull()
+                ?: throw NwcProtocolException("get_balance response missing balance")
+            BalanceResult(BitcoinAmount.fromMsats(balanceMsats))
+        }
+    }
+
+    override suspend fun getInfo(timeoutMillis: Long): NwcResult<GetInfoResult> = runNwcCatching {
+        execute(MethodNames.GET_INFO, timeoutMillis) { obj ->
+            val rawPubkey = obj.string("pubkey")
+            val pubkey = if (rawPubkey.isNullOrBlank()) {
+                NwcLog.warn(logTag) {
+                    "get_info response missing pubkey, defaulting to wallet credential pubkey ${credentials.walletPublicKeyHex}"
+                }
+                credentials.walletPublicKeyHex
+            } else {
+                rawPubkey
+            }
+            GetInfoResult(
+                alias = obj.string("alias"),
+                color = obj.string("color"),
+                pubkey = pubkey,
+                network = Network.fromWire(obj.string("network")),
+                blockHeight = obj["block_height"]?.jsonPrimitive?.longValueOrNull(),
+                blockHash = obj.string("block_hash"),
+                methods = obj.jsonArrayOrNull("methods")
+                    ?.mapNotNull { NwcCapability.fromWire(it.asString()) }?.toSet() ?: emptySet(),
+                notifications = obj.jsonArrayOrNull("notifications")
+                    ?.mapNotNull { NwcNotificationType.fromWire(it.asString()) }?.toSet() ?: emptySet()
+            )
+        }
     }
 
     override suspend fun payInvoice(
         params: PayInvoiceParams,
         timeoutMillis: Long
-    ): NwcResult<PayInvoiceResult> = runNwcCatching { payInvoiceInternal(params, timeoutMillis) }
-
-    private suspend fun payInvoiceInternal(
-        params: PayInvoiceParams,
-        timeoutMillis: Long
-    ): PayInvoiceResult {
-        val payload = buildJsonObject {
-            put("invoice", params.invoice)
-            params.amount?.let { put("amount", it.msats) }
-            params.metadata?.let { put("metadata", it) }
-        }
-        val response = sendSingleRequest(MethodNames.PAY_INVOICE, payload, timeoutMillis)
-        val resultObject = response.result as? JsonObject
-            ?: throw NwcProtocolException("pay_invoice response missing result object")
-        val preimage = resultObject.string("preimage")
-            ?: throw NwcProtocolException("pay_invoice response missing preimage")
-        val feesPaid = resultObject["fees_paid"]?.jsonPrimitive?.longValueOrNull()
-            ?.let { BitcoinAmount.fromMsats(it) }
-        return PayInvoiceResult(preimage = preimage, feesPaid = feesPaid)
+    ): NwcResult<PayInvoiceResult> = runNwcCatching {
+        execute(
+            MethodNames.PAY_INVOICE,
+            timeoutMillis,
+            buildParams = {
+                put("invoice", params.invoice)
+                params.amount?.let { put("amount", it.msats) }
+                params.metadata?.let { put("metadata", it) }
+            }
+        ) { obj -> parsePaymentResult(obj, "pay_invoice") }
     }
 
     override suspend fun multiPayInvoice(
         invoices: List<MultiPayInvoiceItem>,
         timeoutMillis: Long
-    ): NwcResult<Map<String, MultiResult<PayInvoiceResult>>> =
-        runNwcCatching { multiPayInvoiceInternal(invoices, timeoutMillis) }
-
-    private suspend fun multiPayInvoiceInternal(
-        invoices: List<MultiPayInvoiceItem>,
-        timeoutMillis: Long
-    ): Map<String, MultiResult<PayInvoiceResult>> {
+    ): NwcResult<Map<String, MultiResult<PayInvoiceResult>>> = runNwcCatching {
         require(invoices.isNotEmpty()) { "multiPayInvoice requires at least one invoice" }
-        val normalized = invoices.map { item ->
-            val id = item.id ?: randomId()
-            NormalizedInvoiceItem(id, item.invoice, item.amount, item.metadata)
-        }
+        val normalized = invoices.map { item -> (item.id ?: randomId()) to item }
+        val expectedIds = normalized.map { it.first }.toSet()
         val params = buildJsonObject {
             put("invoices", buildJsonArray {
-                normalized.forEach { invoice ->
+                for ((id, invoice) in normalized) {
                     add(buildJsonObject {
-                        put("id", invoice.id)
+                        put("id", id)
                         put("invoice", invoice.invoice)
                         invoice.amount?.let { put("amount", it.msats) }
                         invoice.metadata?.let { put("metadata", it) }
@@ -498,91 +520,49 @@ class NwcClient private constructor(
                 }
             })
         }
-        val expectedIds = normalized.map { it.id }.toSet()
-        val responses = sendMultiRequest(
-            method = MethodNames.MULTI_PAY_INVOICE,
-            params = params,
-            expectedKeys = expectedIds,
-            timeoutMillis = timeoutMillis
-        )
-        return responses.mapValues { (key, raw) ->
-            raw.error?.let { MultiResult.Failure(it) } ?: run {
-                val resultObject = raw.result as? JsonObject
-                    ?: return@mapValues MultiResult.Failure(
-                        NwcError("INVALID_RESULT", "Missing result payload for multi_pay_invoice entry $key")
-                    )
-                val preimage = resultObject.string("preimage")
-                    ?: return@mapValues MultiResult.Failure(
-                        NwcError("INVALID_RESULT", "Missing preimage for multi_pay_invoice entry $key")
-                    )
-                val feesPaid = resultObject["fees_paid"]?.jsonPrimitive?.longValueOrNull()
-                    ?.let { BitcoinAmount.fromMsats(it) }
-                MultiResult.Success(PayInvoiceResult(preimage, feesPaid))
-            }
+        executeMultiRequest(MethodNames.MULTI_PAY_INVOICE, params, expectedIds, timeoutMillis) { obj ->
+            parsePaymentResult(obj, "multi_pay_invoice")
         }
     }
 
     override suspend fun payKeysend(
         params: KeysendParams,
         timeoutMillis: Long
-    ): NwcResult<KeysendResult> = runNwcCatching { payKeysendInternal(params, timeoutMillis) }
-
-    private suspend fun payKeysendInternal(
-        params: KeysendParams,
-        timeoutMillis: Long
-    ): KeysendResult {
-        val payload = buildJsonObject {
-            put("pubkey", params.destinationPubkey)
-            put("amount", params.amount.msats)
-            params.preimage?.let { put("preimage", it) }
-            if (params.tlvRecords.isNotEmpty()) {
-                put("tlv_records", buildJsonArray {
-                    params.tlvRecords.forEach { record ->
-                        add(buildJsonObject {
-                            put("type", record.type)
-                            put("value", record.valueHex)
-                        })
-                    }
-                })
+    ): NwcResult<KeysendResult> = runNwcCatching {
+        execute(
+            MethodNames.PAY_KEYSEND,
+            timeoutMillis,
+            buildParams = {
+                put("pubkey", params.destinationPubkey)
+                put("amount", params.amount.msats)
+                params.preimage?.let { put("preimage", it) }
+                if (params.tlvRecords.isNotEmpty()) {
+                    put("tlv_records", buildJsonArray {
+                        params.tlvRecords.forEach { record ->
+                            add(buildJsonObject {
+                                put("type", record.type)
+                                put("value", record.valueHex)
+                            })
+                        }
+                    })
+                }
             }
-        }
-        val response = sendSingleRequest(MethodNames.PAY_KEYSEND, payload, timeoutMillis)
-        val obj = response.result as? JsonObject
-            ?: throw NwcProtocolException("pay_keysend response missing result object")
-        val preimage = obj.string("preimage")
-            ?: throw NwcProtocolException("pay_keysend response missing preimage")
-        val feesPaid = obj["fees_paid"]?.jsonPrimitive?.longValueOrNull()
-            ?.let { BitcoinAmount.fromMsats(it) }
-        return KeysendResult(preimage, feesPaid)
+        ) { obj -> parsePaymentResult(obj, "pay_keysend") }
     }
 
     override suspend fun multiPayKeysend(
         items: List<MultiKeysendItem>,
         timeoutMillis: Long
-    ): NwcResult<Map<String, MultiResult<KeysendResult>>> =
-        runNwcCatching { multiPayKeysendInternal(items, timeoutMillis) }
-
-    private suspend fun multiPayKeysendInternal(
-        items: List<MultiKeysendItem>,
-        timeoutMillis: Long
-    ): Map<String, MultiResult<KeysendResult>> {
+    ): NwcResult<Map<String, MultiResult<KeysendResult>>> = runNwcCatching {
         require(items.isNotEmpty()) { "multiPayKeysend requires at least one payment" }
-        val normalized = items.map { item ->
-            val id = item.id ?: randomId()
-            NormalizedKeysendItem(
-                id = id,
-                pubkey = item.destinationPubkey,
-                amount = item.amount,
-                preimage = item.preimage,
-                tlvRecords = item.tlvRecords
-            )
-        }
+        val normalized = items.map { item -> (item.id ?: randomId()) to item }
+        val expectedIds = normalized.map { it.first }.toSet()
         val params = buildJsonObject {
             put("keysends", buildJsonArray {
-                normalized.forEach { payment ->
+                for ((id, payment) in normalized) {
                     add(buildJsonObject {
-                        put("id", payment.id)
-                        put("pubkey", payment.pubkey)
+                        put("id", id)
+                        put("pubkey", payment.destinationPubkey)
                         put("amount", payment.amount.msats)
                         payment.preimage?.let { put("preimage", it) }
                         if (payment.tlvRecords.isNotEmpty()) {
@@ -599,163 +579,315 @@ class NwcClient private constructor(
                 }
             })
         }
-        val expected = normalized.map { it.id }.toSet()
-        val responses = sendMultiRequest(
-            method = MethodNames.MULTI_PAY_KEYSEND,
-            params = params,
-            expectedKeys = expected,
-            timeoutMillis = timeoutMillis
-        )
-        return responses.mapValues { (key, raw) ->
-            raw.error?.let { MultiResult.Failure(it) } ?: run {
-                val obj = raw.result as? JsonObject
-                    ?: return@mapValues MultiResult.Failure(
-                        NwcError("INVALID_RESULT", "Missing result payload for multi_pay_keysend entry $key")
-                    )
-                val preimage = obj.string("preimage")
-                    ?: return@mapValues MultiResult.Failure(
-                        NwcError("INVALID_RESULT", "Missing preimage for multi_pay_keysend entry $key")
-                    )
-                val feesPaid = obj["fees_paid"]?.jsonPrimitive?.longValueOrNull()
-                    ?.let { BitcoinAmount.fromMsats(it) }
-                MultiResult.Success(KeysendResult(preimage, feesPaid))
-            }
+        executeMultiRequest(MethodNames.MULTI_PAY_KEYSEND, params, expectedIds, timeoutMillis) { obj ->
+            parsePaymentResult(obj, "multi_pay_keysend")
         }
     }
 
     override suspend fun makeInvoice(
         params: MakeInvoiceParams,
         timeoutMillis: Long
-    ): NwcResult<Transaction> = runNwcCatching { makeInvoiceInternal(params, timeoutMillis) }
-
-    private suspend fun makeInvoiceInternal(
-        params: MakeInvoiceParams,
-        timeoutMillis: Long
-    ): Transaction {
-        val payload = buildJsonObject {
-            put("amount", params.amount.msats)
-            params.description?.let { put("description", it) }
-            params.descriptionHash?.let { put("description_hash", it) }
-            params.expirySeconds?.let { put("expiry", it) }
-            params.metadata?.let { put("metadata", it) }
-        }
-        val response = sendSingleRequest(MethodNames.MAKE_INVOICE, payload, timeoutMillis)
-        val obj = response.result as? JsonObject
-            ?: throw NwcProtocolException("make_invoice response missing result object")
-        return parseTransaction(obj)
+    ): NwcResult<Transaction> = runNwcCatching {
+        execute(
+            MethodNames.MAKE_INVOICE,
+            timeoutMillis,
+            buildParams = {
+                put("amount", params.amount.msats)
+                params.description?.let { put("description", it) }
+                params.descriptionHash?.let { put("description_hash", it) }
+                params.expirySeconds?.let { put("expiry", it) }
+                params.metadata?.let { put("metadata", it) }
+            }
+        ) { obj -> parseTransaction(obj) }
     }
 
     override suspend fun lookupInvoice(
         params: LookupInvoiceParams,
         timeoutMillis: Long
-    ): NwcResult<Transaction> = runNwcCatching { lookupInvoiceInternal(params, timeoutMillis) }
-
-    private suspend fun lookupInvoiceInternal(
-        params: LookupInvoiceParams,
-        timeoutMillis: Long
-    ): Transaction {
-        val payload = buildJsonObject {
-            params.paymentHash?.let { put("payment_hash", it) }
-            params.invoice?.let { put("invoice", it) }
-        }
-        val response = sendSingleRequest(MethodNames.LOOKUP_INVOICE, payload, timeoutMillis)
-        val obj = response.result as? JsonObject
-            ?: throw NwcProtocolException("lookup_invoice response missing result object")
-        return parseTransaction(obj)
+    ): NwcResult<Transaction> = runNwcCatching {
+        execute(
+            MethodNames.LOOKUP_INVOICE,
+            timeoutMillis,
+            buildParams = {
+                params.paymentHash?.let { put("payment_hash", it) }
+                params.invoice?.let { put("invoice", it) }
+            }
+        ) { obj -> parseTransaction(obj) }
     }
 
     override suspend fun listTransactions(
         params: ListTransactionsParams,
         timeoutMillis: Long
-    ): NwcResult<List<Transaction>> = runNwcCatching { listTransactionsInternal(params, timeoutMillis) }
-
-    private suspend fun listTransactionsInternal(
-        params: ListTransactionsParams,
-        timeoutMillis: Long
-    ): List<Transaction> {
-        val payload = buildJsonObject {
-            params.fromTimestamp?.let { put("from", it) }
-            params.untilTimestamp?.let { put("until", it) }
-            params.limit?.let { put("limit", it) }
-            params.offset?.let { put("offset", it) }
-            if (params.includeUnpaidInvoices) {
-                put("unpaid", true)
+    ): NwcResult<List<Transaction>> = runNwcCatching {
+        execute(
+            MethodNames.LIST_TRANSACTIONS,
+            timeoutMillis,
+            buildParams = {
+                params.fromTimestamp?.let { put("from", it) }
+                params.untilTimestamp?.let { put("until", it) }
+                params.limit?.let { put("limit", it) }
+                params.offset?.let { put("offset", it) }
+                if (params.includeUnpaidInvoices) put("unpaid", true)
+                params.type?.let { put("type", it.toWire()) }
             }
-            params.type?.let { put("type", it.toWire()) }
-        }
-        val response = sendSingleRequest(MethodNames.LIST_TRANSACTIONS, payload, timeoutMillis)
-        val obj = response.result as? JsonObject
-            ?: throw NwcProtocolException("list_transactions response missing result object")
-        val array = obj.jsonArrayOrNull("transactions") ?: JsonArray(emptyList())
-        return array.mapNotNull { element ->
-            val transactionObj = element as? JsonObject ?: return@mapNotNull null
-            runCatching { parseTransaction(transactionObj) }.getOrNull()
+        ) { obj ->
+            val array = obj.jsonArrayOrNull("transactions") ?: JsonArray(emptyList())
+            array.map { element ->
+                val txnObj = element as? JsonObject
+                    ?: throw NwcProtocolException("list_transactions entry must be object")
+                parseTransaction(txnObj)
+            }
         }
     }
 
-    override suspend fun describeWallet(timeoutMillis: Long): NwcResult<NwcWalletDescriptor> =
-        runNwcCatching { describeWalletInternal(timeoutMillis) }
-
-    private suspend fun describeWalletInternal(timeoutMillis: Long): NwcWalletDescriptor {
-        val metadata = refreshWalletMetadataInternal(timeoutMillis)
-        val info = getInfoInternal(timeoutMillis)
-        val negotiated = activeEncryption
-        return NwcWalletDescriptor(
+    override suspend fun describeWallet(timeoutMillis: Long): NwcResult<NwcWalletDescriptor> = runNwcCatching {
+        val metadata = refreshWalletMetadata(timeoutMillis).getOrThrow()
+        val info = getInfo(timeoutMillis).getOrThrow()
+        NwcWalletDescriptor(
             uri = credentials.toUri(),
             metadata = metadata,
             info = info,
-            negotiatedEncryption = negotiated,
+            negotiatedEncryption = activeEncryption,
             relays = credentials.relays,
             lud16 = credentials.lud16
         )
     }
 
-    private suspend fun initialize() {
+    // ==================== Background Initialization ====================
+
+    /**
+     * Starts background initialization. Called from create() factory method.
+     * Returns immediately - work happens in background coroutine.
+     */
+    private fun startBackgroundInit() {
         require(credentials.relays.isNotEmpty()) { "No relays provided in credentials" }
+
+        initState.value = InitState.Initializing
         NwcLog.info(logTag) {
-            "Opening NWC session for ${credentials.walletPublicKeyHex} across ${credentials.relays.size} relay(s)"
+            "Starting background initialization for ${credentials.walletPublicKeyHex} " +
+                "across ${credentials.relays.size} relay(s)"
         }
-        session.open(handleOutput = ::handleOutput) { relaySession, _ ->
-            NwcLog.debug(logTag) { "Subscribing to notification stream on relay ${relaySession.url}" }
-            // No broad response subscription - rely on per-request #e tag subscriptions for efficiency
-            if (responseFilters.isNotEmpty()) {
-                relaySession.subscribe(SUBSCRIPTION_RESPONSES, responseFilters)
+
+        initJob = scope.launch {
+            try {
+                // Step 1: Open session (connect to relays)
+                session.open(handleOutput = ::handleOutput) { relaySession, relay ->
+                    NwcLog.debug(logTag) { "Subscribing to notification stream on relay $relay" }
+                    relaySession.subscribe(SUBSCRIPTION_NOTIFICATIONS, notificationFilters)
+                }
+
+                // Step 2: Create subscriptions for each relay
+                val responseFilter = Filter(
+                    kinds = setOf(RESPONSE_KIND),
+                    authors = setOf(walletPublicKeyHex),
+                    tags = mapOf("#$TAG_P" to setOf(clientPublicKeyHex))
+                )
+
+                val startedRelays = session.runtimeHandles.map { it.url }.toSet()
+                val missingRelays = credentials.relays.toSet() - startedRelays
+                val results = session.runtimeHandles.map { handle ->
+                    val subscription = session.sessionRuntime().createResponseSubscription(
+                        relay = handle.url,
+                        filters = listOf(responseFilter),
+                        timeoutMillis = SUBSCRIPTION_SETUP_TIMEOUT_MS,
+                        checkNetwork = true
+                    )
+                    handle.url to (subscription != null)
+                }
+
+                val ready = results.filter { it.second }.map { it.first }.toSet()
+                val failed = (results.filter { !it.second }.map { it.first }.toSet()) + missingRelays
+
+                when {
+                    ready.isNotEmpty() && failed.isEmpty() -> {
+                        initState.value = InitState.Ready(ready)
+                        NwcLog.info(logTag) {
+                            "Initialization complete - all ${ready.size} relay(s) ready"
+                        }
+                    }
+                    ready.isNotEmpty() -> {
+                        initState.value = InitState.PartialReady(ready, failed)
+                        NwcLog.info(logTag) {
+                            "Initialization partial - ${ready.size} relay(s) ready, " +
+                                "${failed.size} pending recovery"
+                        }
+                        // Start background recovery for failed relays
+                        launchRecoveryTask(failed, responseFilter)
+                    }
+                    else -> {
+                        initState.value = InitState.Failed(
+                            NwcNetworkException(
+                                "Failed to establish response subscriptions on any relay - " +
+                                    "all ${credentials.relays.size} relay(s) timed out or failed"
+                            )
+                        )
+                        NwcLog.error(logTag) {
+                            "Initialization failed - no relays available"
+                        }
+                        // Try recovering all relays in the background to take advantage of idle time.
+                        launchRecoveryTask(credentials.relays.toSet(), responseFilter)
+                    }
+                }
+
+            } catch (e: Throwable) {
+                NwcLog.error(logTag, e) { "Background initialization failed" }
+                initState.value = InitState.Failed(e)
             }
-            relaySession.subscribe(SUBSCRIPTION_NOTIFICATIONS, notificationFilters)
         }
-        if (walletMetadataState.value == null) {
-            NwcLog.debug(logTag) { "No cached metadata available, issuing initial describe_wallet request" }
-            refreshWalletMetadataInternal(requestTimeoutMillis)
+    }
+
+    /**
+     * Waits for initialization to be ready enough for requests.
+     * Called at the start of each request method.
+     *
+     * If init previously failed due to network unavailability, retries initialization
+     * since network may now be available.
+     *
+     * @param timeoutMillis Maximum time to wait for initialization
+     * @return List of session handles that are ready for requests
+     * @throws NwcNetworkException if initialization failed
+     * @throws NwcTimeoutException if initialization didn't complete in time
+     */
+    private suspend fun awaitReady(timeoutMillis: Long): List<NwcSessionRuntime.SessionHandle> {
+        val current = initState.value
+        if (current is InitState.Failed) {
+            NwcLog.info(logTag) { "Init previously failed; retrying initialization before serving request" }
+            initState.value = InitState.NotStarted
+            startBackgroundInit()
+        } else if (current is InitState.NotStarted) {
+            startBackgroundInit()
+        }
+
+        val state = withTimeoutOrNull(timeoutMillis) {
+            initState.first { it is InitState.Ready || it is InitState.PartialReady || it is InitState.Failed }
+        } ?: throw NwcTimeoutException("Timed out waiting for client initialization after ${timeoutMillis}ms")
+
+        return when (state) {
+            is InitState.Ready -> session.runtimeHandles.filter {
+                state.readyRelays.contains(it.url) && it.responseSubscription != null
+            }
+            is InitState.PartialReady -> session.runtimeHandles.filter {
+                state.readyRelays.contains(it.url) && it.responseSubscription != null
+            }
+            is InitState.Failed -> throw NwcNetworkException(
+                "Client initialization failed: ${state.error.message}",
+                state.error
+            )
+            else -> throw NwcNetworkException("Unexpected init state: $state", null)
+        }
+    }
+
+    /**
+     * Launches a background task to recover failed relays.
+     * Best-effort - doesn't block or fail the client.
+     */
+    private fun launchRecoveryTask(failedRelays: Set<String>, responseFilter: Filter) {
+        if (failedRelays.isEmpty()) return
+        recoveryJob?.cancel()
+        recoveryJob = scope.launch {
+            var pending = failedRelays.toMutableSet()
+            NwcLog.debug(logTag) { "Starting recovery task for ${pending.size} relay(s)" }
+
+            while (isActive && pending.isNotEmpty()) {
+                val recovered = mutableSetOf<String>()
+                for (relay in pending) {
+                    val handle = session.runtimeHandles.find { it.url == relay } ?: run {
+                        val started = session.sessionRuntime().ensureRelay(
+                            relay = relay,
+                            handleOutput = ::handleOutput,
+                            configure = { relaySession, url ->
+                                relaySession.subscribe(SUBSCRIPTION_NOTIFICATIONS, notificationFilters)
+                            }
+                        )
+                        if (!started) {
+                            NwcLog.debug(logTag) { "Recovery could not start relay $relay" }
+                            continue
+                        }
+                        session.runtimeHandles.find { it.url == relay }
+                    } ?: continue
+
+                    val subscription = session.sessionRuntime().createResponseSubscription(
+                        relay = relay,
+                        filters = listOf(responseFilter),
+                        timeoutMillis = SUBSCRIPTION_SETUP_TIMEOUT_MS,
+                        checkNetwork = true
+                    )
+
+                    if (subscription != null) {
+                        recovered += relay
+                    } else {
+                        NwcLog.debug(logTag) { "Recovery attempt failed for relay $relay" }
+                    }
+                }
+
+                if (recovered.isNotEmpty()) {
+                    val currentState = initState.value
+                    val readySoFar = when (currentState) {
+                        is InitState.PartialReady -> currentState.readyRelays
+                        is InitState.Ready -> currentState.readyRelays
+                        else -> emptySet()
+                    }
+                    val pendingSoFar = when (currentState) {
+                        is InitState.PartialReady -> currentState.pendingRelays
+                        is InitState.Failed -> pending
+                        else -> pending
+                    }
+                    val newReady = readySoFar + recovered
+                    val newPending = (pendingSoFar - recovered)
+                    initState.value = if (newPending.isEmpty()) {
+                        InitState.Ready(newReady)
+                    } else {
+                        InitState.PartialReady(newReady, newPending)
+                    }
+                    NwcLog.info(logTag) { "Recovered ${recovered.size} relay(s): ${recovered.joinToString()}" }
+                    pending.removeAll(recovered)
+                }
+
+                if (pending.isNotEmpty()) {
+                    delay(3_000L)
+                }
+            }
         }
     }
 
     private suspend fun fetchMetadataFrom(
-        session: NwcSessionRuntime.SessionHandle,
+        handle: NwcSessionRuntime.SessionHandle,
         timeoutMillis: Long
     ): WalletMetadata? {
-        val subscriptionId = "nwc-info-${randomId()}"
-        val deferred = CompletableDeferred<Event?>()
-        infoMutex.withLock { infoSubscriptions[subscriptionId] = deferred }
         val filter = Filter(
             kinds = setOf(INFO_EVENT_KIND),
             authors = setOf(walletPublicKeyHex),
             limit = 1
         )
-        session.session.subscribe(subscriptionId, listOf(filter))
-        val resultEvent = try {
-            NwcLog.debug(logTag) { "Waiting for wallet metadata via subscription $subscriptionId on relay ${session.url}" }
-            withTimeout(timeoutMillis) { deferred.await() }
-        } catch (_: TimeoutCancellationException) {
-            NwcLog.warn(logTag) { "Timed out waiting for wallet metadata on relay ${session.url}" }
-            null
-        } finally {
-            infoMutex.withLock { infoSubscriptions.remove(subscriptionId) }
-            session.session.unsubscribe(subscriptionId)
+        NwcLog.debug(logTag) { "Querying wallet metadata from relay ${handle.url}" }
+
+        // Use SmartRelaySession.query for automatic connection handling and retry
+        val result = handle.session.query(
+            filters = listOf(filter),
+            timeoutMillis = timeoutMillis,
+            retryConfig = NwcRetryConfig
+        )
+
+        return when (result) {
+            is RequestResult.Success -> {
+                val event = result.value.firstOrNull()
+                if (event != null) {
+                    NwcLog.debug(logTag) { "Received wallet metadata event ${event.id} from relay ${handle.url}" }
+                    parseWalletMetadata(event)
+                } else {
+                    NwcLog.debug(logTag) { "No wallet metadata event found on relay ${handle.url}" }
+                    null
+                }
+            }
+            is RequestResult.Timeout -> {
+                NwcLog.warn(logTag) { "Timed out waiting for wallet metadata on relay ${handle.url}" }
+                null
+            }
+            is RequestResult.ConnectionFailed -> {
+                NwcLog.warn(logTag) { "Connection failed fetching metadata from relay ${handle.url}: ${result.lastError}" }
+                null
+            }
         }
-        if (resultEvent != null) {
-            NwcLog.debug(logTag) { "Received wallet metadata event ${resultEvent.id} from relay ${session.url}" }
-        }
-        return resultEvent?.let { parseWalletMetadata(it) }
     }
 
     private fun updateActiveEncryption(metadata: WalletMetadata): EncryptionScheme {
@@ -777,25 +909,116 @@ class NwcClient private constructor(
             interceptors.forEach { it.onRequest(method, params) }
         }
         val event = buildRequestEvent(method, params, expirationSeconds)
-        val deferred = CompletableDeferred<RawResponse>()
-        registerPending(event.id, PendingRequest.Single(method, event, deferred))
-        ensureDirectResponseSubscription(event.id)
+
+        // Register for auth retry tracking (uses a dummy deferred since we use SharedSubscription)
+        val dummyDeferred = CompletableDeferred<RawResponse>()
+        pendingRequestManager.register(event.id, PendingRequest.Single(method, dummyDeferred))
+
         try {
             NwcLog.debug(logTag) { "Publishing $method request as event ${event.id}" }
-            publish(event)
+            val result = awaitResponseViaSharedSubscription(event, timeoutMillis)
+            pendingRequestManager.remove(event.id, dummyDeferred)
+
+            val responseEvent = when (result) {
+                is RequestResult.Success -> result.value
+                is RequestResult.Timeout -> {
+                    throw NwcTimeoutException("Timed out waiting for $method response")
+                }
+                is RequestResult.ConnectionFailed -> {
+                    throw NwcNetworkException(
+                        "Connection failed while waiting for $method response: ${result.lastError ?: "unknown"}"
+                    )
+                }
+            }
+
+            NwcLog.debug(logTag) { "Received response for $method request event ${event.id}" }
+            val response = decodeResponse(responseEvent)
+            response.error?.let { throw NwcRequestException(it) }
+            if (hasInterceptors) {
+                interceptors.forEach { it.onResponse(method, response) }
+            }
+            return response
         } catch (failure: Throwable) {
-            NwcLog.error(logTag, failure) { "Failed to publish $method request event ${event.id}" }
-            unsubscribeDirectResponse(event.id)
-            removePending(event.id, deferred)
-            throw NwcException("Failed to publish request $method", failure)
+            pendingRequestManager.remove(event.id, dummyDeferred)
+            if (failure is NwcException) throw failure
+            NwcLog.error(logTag, failure) { "Failed to execute $method request event ${event.id}" }
+            throw NwcException("Failed to execute request $method", failure)
         }
-        val response = awaitSingleResponse(method, event.id, deferred, timeoutMillis)
-        NwcLog.debug(logTag) { "Received response for $method request event ${event.id}" }
-        response.error?.let { throw NwcRequestException(it) }
-        if (hasInterceptors) {
-            interceptors.forEach { it.onResponse(method, response) }
+    }
+
+    /**
+     * Wait for a response using requestOneVia across all relays.
+     * Races all relays - first successful response wins.
+     *
+     * Uses SmartRelaySession.requestOneVia which provides:
+     * - Race-free expectAndPublish (registers expectation before publishing)
+     * - Auto-connect if needed
+     * - Stale connection detection and reconnection
+     * - Retry logic with EagerRetryConfig
+     *
+     * @return RequestResult with the response event, or failure details (Timeout/ConnectionFailed)
+     * @throws NwcNetworkException if no response subscriptions are available (relay connection failed)
+     */
+    private suspend fun awaitResponseViaSharedSubscription(
+        requestEvent: Event,
+        timeoutMillis: Long
+    ): RequestResult<Event> {
+        // Wait for initialization to complete (bounded by request timeout)
+        val handlesWithSubscription = awaitReady(timeoutMillis)
+        if (handlesWithSubscription.isEmpty()) {
+            throw NwcNetworkException(
+                "No response subscriptions available - initialization failed"
+            )
         }
-        return response
+
+        // Use NwcRetryConfig for stale connection detection:
+        // - If timeout occurs while "connected", triggers reconnect and retry
+        // - Detects dead connections (e.g., WiFi disabled) without waiting for ping
+        val retryConfig = NwcRetryConfig
+
+        // Launch requestOneVia on all relays and race them
+        val requests = handlesWithSubscription.map { handle ->
+            scope.async {
+                handle.session.requestOneVia(
+                    subscription = handle.responseSubscription!!,
+                    requestEvent = requestEvent,
+                    correlationId = requestEvent.id,
+                    timeoutMillis = timeoutMillis,
+                    retryConfig = retryConfig
+                )
+            }
+        }
+
+        // Collect all results - return first success, or aggregate failures
+        val failures = mutableListOf<RequestResult<Event>>()
+
+        return coroutineScope {
+            val resultChannel = Channel<RequestResult<Event>>(requests.size)
+
+            requests.forEach { deferred ->
+                launch {
+                    val result = deferred.await()
+                    resultChannel.send(result)
+                }
+            }
+
+            repeat(requests.size) {
+                val result = resultChannel.receive()
+                when (result) {
+                    is RequestResult.Success -> {
+                        // Cancel remaining requests and return success
+                        requests.forEach { it.cancel() }
+                        return@coroutineScope result
+                    }
+                    else -> failures.add(result)
+                }
+            }
+
+            // All relays failed - prefer ConnectionFailed over Timeout (more specific)
+            failures.firstOrNull { it is RequestResult.ConnectionFailed }
+                ?: failures.firstOrNull()
+                ?: RequestResult.Timeout(timeoutMillis)
+        }
     }
 
     private suspend fun sendMultiRequest(
@@ -806,30 +1029,43 @@ class NwcClient private constructor(
         expirationSeconds: Long? = null
     ): Map<String, RawResponse> {
         require(expectedKeys.isNotEmpty()) { "Multi request expected keys cannot be empty" }
+        awaitReady(timeoutMillis)
         if (hasInterceptors) {
             interceptors.forEach { it.onRequest(method, params) }
         }
         val event = buildRequestEvent(method, params, expirationSeconds)
         val deferred = CompletableDeferred<Map<String, RawResponse>>()
-        registerPending(
+        pendingRequestManager.register(
             event.id,
             PendingRequest.Multi(
                 method = method,
-                event = event,
                 expectedKeys = expectedKeys,
                 results = mutableMapOf(),
                 deferred = deferred
             )
         )
-        ensureDirectResponseSubscription(event.id)
-        try {
+        val firstResponseResult = try {
             NwcLog.debug(logTag) { "Publishing multi request $method (event ${event.id}) expecting ${expectedKeys.size} keys" }
-            publish(event)
+            awaitResponseViaSharedSubscription(event, timeoutMillis)
         } catch (failure: Throwable) {
-            NwcLog.error(logTag, failure) { "Failed to publish multi request $method event ${event.id}" }
-            unsubscribeDirectResponse(event.id)
-            removePending(event.id, deferred)
-            throw NwcException("Failed to publish multi request $method", failure)
+            pendingRequestManager.remove(event.id, deferred)
+            throw failure
+        }
+        when (firstResponseResult) {
+            is RequestResult.Success -> {
+                // Process the first response to seed the multi map; additional responses will be handled via subscriptions.
+                processResponseEvent(firstResponseResult.value, requestIdOverride = event.id)
+            }
+            is RequestResult.Timeout -> {
+                pendingRequestManager.remove(event.id, deferred)
+                throw NwcTimeoutException("Timed out waiting for $method response")
+            }
+            is RequestResult.ConnectionFailed -> {
+                pendingRequestManager.remove(event.id, deferred)
+                throw NwcNetworkException(
+                    "Connection failed while waiting for $method response: ${firstResponseResult.lastError ?: "unknown"}"
+                )
+            }
         }
         val responses = try {
             withTimeout(timeoutMillis) { deferred.await() }
@@ -837,15 +1073,7 @@ class NwcClient private constructor(
             NwcLog.warn(logTag, timeout) { "Timed out waiting for responses to $method request event ${event.id}" }
             throw NwcTimeoutException("Timed out waiting for $method responses", timeout)
         } finally {
-            val removed = pendingMutex.withLock {
-                val pending = pendingRequests[event.id]
-                if (pending is PendingRequest.Multi && pending.deferred == deferred) {
-                    pendingRequests.remove(event.id)
-                    true
-                } else {
-                    false
-                }
-            }
+            pendingRequestManager.remove(event.id, deferred)
         }
         if (hasInterceptors) {
             responses.forEach { (_, response) ->
@@ -854,57 +1082,6 @@ class NwcClient private constructor(
         }
         NwcLog.debug(logTag) { "Collected ${responses.size} responses for $method event ${event.id}" }
         return responses
-    }
-
-    private suspend fun awaitSingleResponse(
-        method: String,
-        requestId: String,
-        deferred: CompletableDeferred<RawResponse>,
-        timeoutMillis: Long
-    ): RawResponse =
-        try {
-            withTimeout(timeoutMillis) { deferred.await() }
-        } catch (timeout: TimeoutCancellationException) {
-            throw NwcTimeoutException("Timed out waiting for $method response", timeout)
-        } finally {
-            val removed = pendingMutex.withLock {
-                val pending = pendingRequests[requestId]
-                if (pending is PendingRequest.Single && pending.deferred == deferred) {
-                    pendingRequests.remove(requestId)
-                    true
-                } else {
-                    false
-                }
-            }
-            if (removed) {
-                unsubscribeDirectResponse(requestId)
-            }
-        }
-
-    private suspend fun registerPending(requestId: String, pending: PendingRequest) {
-        pendingMutex.withLock {
-            pendingRequests[requestId] = pending
-        }
-    }
-
-    private suspend fun removePending(requestId: String, deferred: CompletableDeferred<*>) {
-        val removed = pendingMutex.withLock {
-            val current = pendingRequests[requestId]
-            val matches = when {
-                current is PendingRequest.Single && current.deferred == deferred -> true
-                current is PendingRequest.Multi && current.deferred == deferred -> true
-                else -> false
-            }
-            if (matches) {
-                pendingRequests.remove(requestId)
-                true
-            } else {
-                false
-            }
-        }
-        if (removed) {
-            unsubscribeDirectResponse(requestId)
-        }
     }
 
     private suspend fun publish(event: Event) {
@@ -936,7 +1113,6 @@ class NwcClient private constructor(
 
     private suspend fun handleOutput(relay: String, output: RelaySessionOutput) {
         when (output) {
-            is RelaySessionOutput.AuthChallenge -> handleAuthChallenge(relay, output)
             is RelaySessionOutput.PublishAcknowledged -> handlePublishAcknowledged(relay, output.result)
             is RelaySessionOutput.EventReceived -> handleEvent(output.subscriptionId, output.event)
             is RelaySessionOutput.EndOfStoredEvents -> handleEndOfEvents(output.subscriptionId)
@@ -951,203 +1127,41 @@ class NwcClient private constructor(
     }
 
     private suspend fun handleEvent(subscriptionId: SubscriptionId, event: Event) {
-        val id = subscriptionId.value
-        val isDirect = directResponseMutex.withLock { directResponseLookup.containsKey(id) }
-        if (isDirect) {
-            processResponseEvent(event)
-            return
-        }
-        if (completeInfoRequest(id, event)) return
-        when (id) {
-            SUBSCRIPTION_RESPONSES -> processResponseEvent(event)
-            SUBSCRIPTION_NOTIFICATIONS -> processNotificationEvent(event)
+        when {
+            // Route response events to processResponseEvent (handles both single and multi)
+            event.kind == RESPONSE_KIND -> processResponseEvent(event)
+            subscriptionId.value == SUBSCRIPTION_NOTIFICATIONS -> processNotificationEvent(event)
         }
     }
 
-    private suspend fun handleEndOfEvents(subscriptionId: SubscriptionId) {
-        val id = subscriptionId.value
-        infoMutex.withLock {
-            infoSubscriptions[id]?.takeIf { !it.isCompleted }?.complete(null)
-        }
-        NwcLog.debug(logTag) { "Relay signaled end-of-stored-events for subscription $id" }
+    private fun handleEndOfEvents(subscriptionId: SubscriptionId) {
+        NwcLog.debug(logTag) { "Relay signaled end-of-stored-events for subscription ${subscriptionId.value}" }
     }
 
-    private suspend fun handleSubscriptionTerminated(message: RelaySessionOutput.SubscriptionTerminated) {
-        val id = message.subscriptionId.value
-        infoMutex.withLock {
-            infoSubscriptions[id]?.takeIf { !it.isCompleted }?.complete(null)
-        }
+    private fun handleSubscriptionTerminated(message: RelaySessionOutput.SubscriptionTerminated) {
         val details = buildString {
-            append("Relay terminated subscription $id: ${message.reason}")
+            append("Relay terminated subscription ${message.subscriptionId.value}: ${message.reason}")
             message.code?.let { append(" (code=$it)") }
         }
         NwcLog.warn(logTag) { details }
     }
 
-    private suspend fun handleAuthChallenge(relay: String, challenge: RelaySessionOutput.AuthChallenge) {
-        val relayUrl = challenge.relayUrl?.takeUnless { it.isBlank() } ?: relay
-        NwcLog.info(logTag) { "Relay $relay issued NIP-42 challenge '${challenge.challenge.take(16)}${if (challenge.challenge.length > 16) "…" else ""}'" }
-        val pendingRequestIds = authMutex.withLock {
-            val state = relayAuthStates.getOrPut(relay) { RelayAuthState() }
-            state.relayUrl = relayUrl
-            state.challenge = challenge.challenge
-            val pending = state.pendingRequestIds.toList()
-            state.pendingRequestIds.clear()
-            pending
-        }
-        val authEvent = try {
-            Nip42Auth.buildAuthEvent(
-                signer = identity,
-                relayUrl = relayUrl,
-                challenge = challenge.challenge
-            )
-        } catch (_: Throwable) {
-            authMutex.withLock {
-                relayAuthStates[relay]?.pendingRequestIds?.addAll(pendingRequestIds)
-            }
-            NwcLog.error(logTag) { "Failed to build NIP-42 auth event for relay $relay" }
-            return
-        }
-        try {
-            authMutex.withLock {
-                val state = relayAuthStates.getOrPut(relay) { RelayAuthState() }
-                state.lastAuthEventId = authEvent.id
-                state.lastAuthAccepted = null
-                state.lastAuthMessage = null
-            }
-            NwcLog.debug(logTag) { "Dispatching auth event ${authEvent.id} to relay $relay" }
-            session.sessionRuntime().authenticate(relay, authEvent)
-        } catch (_: Throwable) {
-            authMutex.withLock {
-                relayAuthStates[relay]?.pendingRequestIds?.addAll(pendingRequestIds)
-            }
-            NwcLog.warn(logTag) { "Failed to send auth event ${authEvent.id} to relay $relay; will retry when possible" }
-            return
-        }
-        if (pendingRequestIds.isNotEmpty()) {
-            NwcLog.debug(logTag) { "Retrying ${pendingRequestIds.size} pending request(s) after auth on relay $relay" }
-            resendPendingRequests(relay, pendingRequestIds)
-        }
-    }
-
-    private suspend fun handlePublishAcknowledged(relay: String, result: PublishResult) {
+    private fun handlePublishAcknowledged(relay: String, result: PublishResult) {
         NwcLog.debug(logTag) {
             "Relay $relay acknowledged event ${result.eventId}: accepted=${result.accepted}, code=${result.code}, message='${result.message}'"
         }
-        val handledAuth = authMutex.withLock {
-            val state = relayAuthStates[relay]
-            if (state?.lastAuthEventId == result.eventId) {
-                state.lastAuthAccepted = result.accepted
-                state.lastAuthMessage = result.message
-                if (!result.accepted) {
-                    state.challenge = null
-                }
-                val status = if (result.accepted) "accepted" else "rejected"
-                NwcLog.info(logTag) { "Relay $relay $status auth event ${result.eventId}: ${result.message}" }
-                true
-            } else {
-                false
-            }
-        }
-        if (handledAuth) return
-        val requiresAuth = !result.accepted && result.code?.equals(AUTH_REQUIRED_CODE, ignoreCase = true) == true
-        if (requiresAuth) {
-            NwcLog.debug(logTag) { "Relay $relay rejected publish ${result.eventId} with auth-required" }
-            handleAuthRequired(relay, result)
-        } else if (!result.accepted) {
+        if (!result.accepted) {
             NwcLog.warn(logTag) {
                 "Relay $relay rejected event ${result.eventId} with code=${result.code ?: "unknown"} message='${result.message}'"
             }
         }
     }
 
-    private suspend fun handleAuthRequired(relay: String, result: PublishResult) {
-        var currentAttempts = 0
-        val hasPending = pendingMutex.withLock {
-            val pending = pendingRequests[result.eventId] as? PendingRequest ?: return@withLock false
-            val attempts = pending.relayAttempts[relay] ?: 0
-            if (attempts >= MAX_AUTH_RETRIES_PER_RELAY) {
-                NwcLog.warn(logTag) { "Relay $relay still requires auth for event ${result.eventId} after $attempts attempts; giving up" }
-                false
-            } else {
-                currentAttempts = attempts
-                true
-            }
-        }
-        if (!hasPending) return
-
-        var resolvedRelayUrl = relay
-        val challenge = authMutex.withLock {
-            val state = relayAuthStates.getOrPut(relay) { RelayAuthState() }
-            resolvedRelayUrl = state.relayUrl ?: relay
-            val challengeValue = state.challenge
-            if (challengeValue == null) {
-                state.pendingRequestIds.add(result.eventId)
-                NwcLog.debug(logTag) { "Queued request ${result.eventId} until challenge arrives for relay $relay" }
-            }
-            challengeValue
-        } ?: return
-
-        val authEvent = try {
-            Nip42Auth.buildAuthEvent(
-                signer = identity,
-                relayUrl = resolvedRelayUrl,
-                challenge = challenge
-            )
-        } catch (_: Throwable) {
-            return
-        }
-
-        try {
-            authMutex.withLock {
-                val state = relayAuthStates.getOrPut(relay) { RelayAuthState() }
-                state.lastAuthEventId = authEvent.id
-                state.lastAuthAccepted = null
-                state.lastAuthMessage = null
-            }
-            session.sessionRuntime().authenticate(relay, authEvent)
-        } catch (_: Throwable) {
-            NwcLog.warn(logTag) { "Failed to send retry auth event for relay $relay" }
-            authMutex.withLock {
-                relayAuthStates[relay]?.pendingRequestIds?.add(result.eventId)
-            }
-            return
-        }
-
-        pendingMutex.withLock {
-            (pendingRequests[result.eventId] as? PendingRequest)?.relayAttempts?.set(relay, currentAttempts + 1)
-        }
-        NwcLog.debug(logTag) { "Auth attempt ${currentAttempts + 1} dispatched for event ${result.eventId} on relay $relay" }
-        resendPendingRequests(relay, listOf(result.eventId))
-    }
-
-    private suspend fun resendPendingRequests(relay: String, requestIds: List<String>) {
-        for (requestId in requestIds) {
-            val event = pendingMutex.withLock {
-                (pendingRequests[requestId] as? PendingRequest)?.event
-            } ?: continue
-            runCatching {
-                NwcLog.debug(logTag) { "Replaying request event $requestId to relay $relay" }
-                session.sessionRuntime().publishTo(relay, event)
-            }.onFailure {
-                NwcLog.warn(logTag, it) { "Failed to replay request event $requestId to relay $relay" }
-            }
-        }
-    }
-
-    private suspend fun completeInfoRequest(subscriptionId: String, event: Event): Boolean {
-        val deferred = infoMutex.withLock { infoSubscriptions[subscriptionId] } ?: return false
-        if (!deferred.isCompleted) {
-            deferred.complete(event)
-        }
-        return true
-    }
-
     private suspend fun processResponseEvent(event: Event, requestIdOverride: String? = null) {
         if (!event.isIntendedWalletMessage()) return
         val tagRequestId = requestIdOverride ?: event.tagValue(TAG_E)
         val rawResponse = runCatching { decodeResponse(event) }.getOrElse { failure ->
-            val fallbackId = tagRequestId ?: pendingMutex.withLock { pendingRequests.keys.singleOrNull() }
+            val fallbackId = tagRequestId ?: pendingRequestManager.getSinglePendingId()
             if (fallbackId != null) {
                 val error = NwcError("DECRYPTION_FAILED", failure.message ?: "Failed to decrypt response")
                 NwcLog.error(logTag, failure) { "Failed to decrypt response for request $fallbackId" }
@@ -1158,52 +1172,24 @@ class NwcClient private constructor(
             return
         }
         val requestId = tagRequestId
-            ?: resolveRequestId(rawResponse)
-            ?: pendingMutex.withLock { pendingRequests.keys.singleOrNull() }
+            ?: pendingRequestManager.resolveRequestId(rawResponse)
+            ?: pendingRequestManager.getSinglePendingId()
             ?: run {
                 NwcLog.warn(logTag) { "Dropping response missing #e tag; no unambiguous pending request" }
                 return
             }
-        var shouldUnsubscribe = false
-        pendingMutex.withLock {
-            when (val pending = pendingRequests[requestId]) {
-                is PendingRequest.Single -> {
-                    if (!pending.deferred.isCompleted) {
-                        NwcLog.debug(logTag) { "Completing single response for event $requestId" }
-                        pending.deferred.complete(rawResponse)
-                    }
-                    pendingRequests.remove(requestId)
-                    shouldUnsubscribe = true
-                }
-                is PendingRequest.Multi -> {
-                    val key = event.tagValue(TAG_D) ?: deriveMultiKey(rawResponse)
-                    if (key != null && !pending.results.containsKey(key)) {
-                        pending.results[key] = rawResponse
-                        if (pending.results.keys.containsAll(pending.expectedKeys)) {
-                            NwcLog.debug(logTag) { "Collected final multi response for event $requestId" }
-                            pending.deferred.complete(pending.results.toMap())
-                            pendingRequests.remove(requestId)
-                            shouldUnsubscribe = true
-                        }
-                    }
-                }
-                else -> Unit
-            }
-        }
-        if (shouldUnsubscribe) {
-            unsubscribeDirectResponse(requestId)
-        }
-    }
 
-    private suspend fun resolveRequestId(rawResponse: RawResponse): String? {
-        val resultType = rawResponse.resultType
-        val snapshot = pendingMutex.withLock { pendingRequests.toMap() }
-        if (snapshot.size == 1) return snapshot.keys.first()
-        if (resultType != null) {
-            val byMethod = snapshot.filterValues { it.method == resultType }.keys
-            if (byMethod.size == 1) return byMethod.first()
+        // Try completing as single request first
+        val singleResult = pendingRequestManager.completeSingle(requestId, rawResponse)
+        if (singleResult is PendingRequestManager.CompletionResult.SingleCompleted) {
+            return
         }
-        return null
+
+        // Try completing as multi request
+        val key = event.tagValue(TAG_D) ?: deriveMultiKey(rawResponse)
+        if (key != null) {
+            pendingRequestManager.addMultiResponse(requestId, key, rawResponse)
+        }
     }
 
     private fun deriveMultiKey(response: RawResponse): String? {
@@ -1212,27 +1198,7 @@ class NwcClient private constructor(
     }
 
     private suspend fun completeRequestError(requestId: String, error: NwcError) {
-        var shouldUnsubscribe = false
-        pendingMutex.withLock {
-            when (val pending = pendingRequests.remove(requestId)) {
-                is PendingRequest.Single -> {
-                    NwcLog.warn(logTag) { "Completing request $requestId with error ${error.code}" }
-                    pending.deferred.complete(RawResponse("", null, error))
-                    shouldUnsubscribe = true
-                }
-                is PendingRequest.Multi -> {
-                    NwcLog.warn(logTag) { "Completing multi request $requestId with error ${error.code}" }
-                    pending.deferred.complete(
-                        pending.expectedKeys.associateWith { RawResponse("", null, error) }
-                    )
-                    shouldUnsubscribe = true
-                }
-                else -> Unit
-            }
-        }
-        if (shouldUnsubscribe) {
-            unsubscribeDirectResponse(requestId)
-        }
+        pendingRequestManager.completeWithError(requestId, error)
     }
 
     private fun decodeResponse(event: Event): RawResponse {
@@ -1243,19 +1209,7 @@ class NwcClient private constructor(
         val plaintext = decryptWithSelection(event.content, selection)
         val element = json.parseToJsonElement(plaintext)
         val obj = element as? JsonObject ?: throw NwcProtocolException("Response payload must be JSON object")
-        val resultType = obj["result_type"]?.jsonPrimitive?.content
-            ?: throw NwcProtocolException("Response missing result_type")
-        val error = parseError(obj["error"])
-        val result = obj["result"]
-        return RawResponse(resultType, result, error)
-    }
-
-    private fun parseError(element: JsonElement?): NwcError? {
-        if (element == null || element is JsonNull) return null
-        val obj = element as? JsonObject ?: return null
-        val code = obj.string("code") ?: return null
-        val message = obj.string("message") ?: ""
-        return NwcError(code, message)
+        return decodeRawResponse(obj)
     }
 
     private fun processNotificationEvent(event: Event) {
@@ -1279,33 +1233,12 @@ class NwcClient private constructor(
         _notifications.tryEmit(notification)
     }
 
-    private fun parseTransaction(source: JsonObject): Transaction {
-        val type = TransactionType.fromWire(source.string("type"))
-            ?: throw NwcProtocolException("Transaction missing type")
-        val paymentHash = source.string("payment_hash")
-            ?: throw NwcProtocolException("Transaction missing payment_hash")
-        val amountMsats = source["amount"]?.jsonPrimitive?.longValueOrNull()
-            ?: throw NwcProtocolException("Transaction missing amount")
-        val createdAt = source["created_at"]?.jsonPrimitive?.longValueOrNull()
-            ?: throw NwcProtocolException("Transaction missing created_at")
-        val state = TransactionState.fromWire(source.string("state"))
-        val feesPaid = source["fees_paid"]?.jsonPrimitive?.longValueOrNull()?.let { BitcoinAmount.fromMsats(it) }
-        val metadata = source.jsonObjectOrNull("metadata")
-        return Transaction(
-            type = type,
-            state = state,
-            invoice = source.string("invoice"),
-            description = source.string("description"),
-            descriptionHash = source.string("description_hash"),
-            preimage = source.string("preimage"),
-            paymentHash = paymentHash,
-            amount = BitcoinAmount.fromMsats(amountMsats),
-            feesPaid = feesPaid,
-            createdAt = createdAt,
-            expiresAt = source["expires_at"]?.jsonPrimitive?.longValueOrNull(),
-            settledAt = source["settled_at"]?.jsonPrimitive?.longValueOrNull(),
-            metadata = metadata
-        )
+    private fun parsePaymentResult(obj: JsonObject, method: String): PayInvoiceResult {
+        val preimage = obj.string("preimage")
+            ?: throw NwcProtocolException("$method response missing preimage")
+        val feesPaid = obj["fees_paid"]?.jsonPrimitive?.longValueOrNull()
+            ?.let { BitcoinAmount.fromMsats(it) }
+        return PayInvoiceResult(preimage = preimage, feesPaid = feesPaid)
     }
 
     private fun encryptPayload(plaintext: String, scheme: EncryptionScheme): String = when (scheme) {
@@ -1337,39 +1270,6 @@ class NwcClient private constructor(
         }
     }
 
-    private fun parseWalletMetadata(event: Event): WalletMetadata {
-        val capabilityValues = event.content
-            .split(' ', '\n', '\t')
-            .mapNotNull { it.trim().takeIf { it.isNotEmpty() } }
-        val capabilities = NwcCapability.parseAll(capabilityValues)
-        val encryptionInfo = parseEncryptionTagValues(event.tagValues(TAG_ENCRYPTION))
-        val encryptionSchemes = when {
-            encryptionInfo.schemes.isEmpty() && encryptionInfo.defaultedToNip04 -> setOf(EncryptionScheme.Nip04)
-            encryptionInfo.schemes.isNotEmpty() -> encryptionInfo.schemes.toSet()
-            else -> emptySet()
-        }
-        val notificationsTag = event.tags.firstOrNull { it.firstOrNull() == "notifications" }
-        val notificationValues = notificationsTag?.getOrNull(1)
-            ?.split(' ')
-            ?.mapNotNull { it.trim().takeIf { it.isNotEmpty() } }
-            ?: emptyList()
-        val notificationTypes = NwcNotificationType.parseAll(notificationValues)
-        return WalletMetadata(capabilities, encryptionSchemes, notificationTypes, encryptionInfo.defaultedToNip04)
-    }
-
-    private fun TransactionType.toWire(): String = when (this) {
-        TransactionType.INCOMING -> "incoming"
-        TransactionType.OUTGOING -> "outgoing"
-    }
-
-    private fun Event.tagValue(name: String): String? =
-        tags.firstOrNull { it.isNotEmpty() && it[0] == name }?.getOrNull(1)
-
-    private fun Event.tagValues(name: String): List<String>? =
-        tags.firstOrNull { it.isNotEmpty() && it[0] == name }
-            ?.drop(1)
-            ?.takeIf { it.isNotEmpty() }
-
     private fun Event.isIntendedWalletMessage(): Boolean {
         // Must be from the expected wallet
         if (!pubkey.equals(walletPublicKeyHex, ignoreCase = true)) return false
@@ -1390,7 +1290,8 @@ class NwcClient private constructor(
                 try {
                     return decryptPayload(payload, EncryptionScheme.Nip04)
                 } catch (fallbackFailure: Throwable) {
-                    throw fallbackFailure
+                    primaryFailure.addSuppressed(fallbackFailure)
+                    throw primaryFailure
                 }
             } else {
                 throw primaryFailure
@@ -1407,78 +1308,8 @@ class NwcClient private constructor(
         return bytes.toHexLower()
     }
 
-    private suspend fun ensureDirectResponseSubscription(eventId: String) {
-        if (directResponseMutex.withLock { directResponseSubscriptions.containsKey(eventId) }) return
-        val handles = session.runtimeHandles
-        if (handles.isEmpty()) return
-        val filter = Filter(
-            kinds = setOf(RESPONSE_KIND),
-            authors = setOf(walletPublicKeyHex),
-            tags = mapOf("#$TAG_E" to setOf(eventId))
-        )
-        val created = mutableListOf<PendingResponseSubscription>()
-        handles.forEach { handle ->
-            val subscriptionId = "nwc-response-${eventId.take(8)}-${randomId().take(6)}"
-            runCatching { handle.session.subscribe(subscriptionId, listOf(filter)) }
-                .onSuccess {
-                    created += PendingResponseSubscription(handle, subscriptionId)
-                }
-                .onFailure { failure ->
-                    NwcLog.warn(logTag, failure) {
-                        "Failed to create direct response subscription $subscriptionId on ${handle.url}"
-                    }
-                }
-        }
-        if (created.isNotEmpty()) {
-            directResponseMutex.withLock {
-                directResponseSubscriptions[eventId] = created
-                created.forEach { pending ->
-                    directResponseLookup[pending.subscriptionId] = eventId
-                }
-            }
-            NwcLog.debug(logTag) { "Subscribed for direct response to event $eventId on ${created.size} session(s)" }
-        }
-    }
-
-    private suspend fun unsubscribeDirectResponse(eventId: String) {
-        val subscriptions = directResponseMutex.withLock { directResponseSubscriptions.remove(eventId) } ?: return
-        subscriptions.forEach { subscription ->
-            runCatching { subscription.handle.session.unsubscribe(subscription.subscriptionId) }
-                .onFailure { failure ->
-                    NwcLog.warn(logTag, failure) {
-                        "Failed to unsubscribe ${subscription.subscriptionId} from ${subscription.handle.url}"
-                    }
-                }
-            directResponseMutex.withLock {
-                directResponseLookup.remove(subscription.subscriptionId)
-            }
-        }
-    }
-
-    private data class NormalizedInvoiceItem(
-        val id: String,
-        val invoice: String,
-        val amount: BitcoinAmount?,
-        val metadata: JsonObject?
-    )
-
-    private data class NormalizedKeysendItem(
-        val id: String,
-        val pubkey: String,
-        val amount: BitcoinAmount,
-        val preimage: String?,
-        val tlvRecords: List<KeysendTlvRecord>
-    )
-
     private data class ResolvedEncryption(
         val scheme: EncryptionScheme,
         val fromTag: Boolean
     )
-
-    private data class PendingResponseSubscription(
-        val handle: NwcSessionRuntime.SessionHandle,
-        val subscriptionId: String
-    )
 }
-
-class NwcProtocolException(message: String) : NwcException(message)

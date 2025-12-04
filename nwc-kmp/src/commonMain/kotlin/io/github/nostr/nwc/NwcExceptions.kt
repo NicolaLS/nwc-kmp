@@ -9,4 +9,8 @@ class NwcRequestException(val error: NwcError) :
 
 class NwcTimeoutException(message: String, cause: Throwable? = null) : NwcException(message, cause)
 
+class NwcNetworkException(message: String, cause: Throwable? = null) : NwcException(message, cause)
+
 class NwcEncryptionException(message: String) : NwcException(message)
+
+class NwcProtocolException(message: String) : NwcException(message)

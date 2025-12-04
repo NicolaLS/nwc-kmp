@@ -34,19 +34,10 @@ suspend fun discoverWallet(
     session: NwcSession,
     requestTimeoutMillis: Long = DEFAULT_REQUEST_TIMEOUT_MS
 ): NwcResult<NwcWalletDescriptor> {
-    val client = NwcClient.create(
-        credentials = session.credentials,
-        scope = session.coroutineScope,
-        session = session,
-        ownsSession = false,
-        httpClient = session.httpClientInternal,
-        ownsHttpClient = false,
-        requestTimeoutMillis = requestTimeoutMillis
-    )
-    val result = try {
+    val client = NwcClient.createWithSession(session, requestTimeoutMillis)
+    return try {
         client.describeWallet(requestTimeoutMillis)
     } finally {
         client.close()
     }
-    return result
 }

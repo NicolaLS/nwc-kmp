@@ -346,11 +346,6 @@ class ScriptedWalletHarness {
         feesPaid?.let { put("fees_paid", it.msats) }
     }
 
-    private fun TransactionType.toWire(): String = when (this) {
-        TransactionType.INCOMING -> "incoming"
-        TransactionType.OUTGOING -> "outgoing"
-    }
-
     private fun randomHex(bytes: Int): String {
         val buffer = ByteArray(bytes)
         Random.nextBytes(buffer)

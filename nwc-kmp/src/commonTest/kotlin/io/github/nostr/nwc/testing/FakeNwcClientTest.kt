@@ -28,14 +28,14 @@ class FakeNwcClientTest {
     fun refreshWalletMetadataUpdatesState() = runTest {
         val metadata = WalletMetadata(emptySet(), emptySet(), emptySet())
         val fake = FakeNwcClient()
-        fake.enqueueRefreshWalletMetadataResult(NwcResult.Success(metadata))
+        fake.refreshWalletMetadata.enqueue(NwcResult.Success(metadata))
 
         val result = fake.refreshWalletMetadata(timeoutMillis = 150)
 
         val success = assertIs<NwcResult.Success<WalletMetadata>>(result)
         assertEquals(metadata, success.value)
         assertEquals(metadata, fake.walletMetadata.value)
-        assertEquals(listOf(150L), fake.refreshWalletMetadataCalls)
+        assertEquals(listOf(150L), fake.refreshWalletMetadata.calls)
     }
 
     @Test
@@ -46,16 +46,13 @@ class FakeNwcClientTest {
             preimage = "deadbeef",
             feesPaid = BitcoinAmount.fromMsats(2500)
         )
-        fake.enqueuePayInvoiceResult(NwcResult.Success(expected))
+        fake.payInvoice.enqueue(NwcResult.Success(expected))
 
         val result = fake.payInvoice(params, timeoutMillis = 200)
 
         val success = assertIs<NwcResult.Success<PayInvoiceResult>>(result)
         assertEquals(expected, success.value)
-        assertEquals(
-            listOf(FakeNwcClient.PayInvoiceCall(params, 200)),
-            fake.payInvoiceCalls
-        )
+        assertEquals(listOf(params to 200L), fake.payInvoice.calls)
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
