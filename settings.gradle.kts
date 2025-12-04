@@ -12,10 +12,10 @@ pluginManagement {
 
 dependencyResolutionManagement {
     repositories {
+        mavenLocal() // Local snapshots take precedence for development
         google()
         mavenCentral()
         maven("https://central.sonatype.com/repository/maven-snapshots/")
-        mavenLocal()
     }
 }
 

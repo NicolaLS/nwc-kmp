@@ -17,7 +17,7 @@ import kotlinx.coroutines.sync.withLock
 import nostr.codec.kotlinx.serialization.KotlinxSerializationWireCodec
 import nostr.core.session.RelaySessionOutput
 import nostr.core.session.RelaySessionSettings
-import nostr.runtime.coroutines.RelaySessionManager
+import nostr.runtime.coroutines.SmartRelaySession
 import io.github.nostr.nwc.model.RelayConnectionStatus
 
 class NwcSession private constructor(
@@ -55,7 +55,7 @@ class NwcSession private constructor(
 
     suspend fun open(
         handleOutput: suspend (String, RelaySessionOutput) -> Unit = { _, _ -> },
-        configure: suspend (RelaySessionManager.ManagedRelaySession, String) -> Unit = { _, _ -> }
+        configure: suspend (SmartRelaySession, String) -> Unit = { _, _ -> }
     ) {
         lifecycleMutex.withLock {
             check(lifecycle != Lifecycle.Closed) { "NwcSession is already closed." }
@@ -97,7 +97,7 @@ class NwcSession private constructor(
 
     suspend fun <T> use(
         handleOutput: suspend (String, RelaySessionOutput) -> Unit = { _, _ -> },
-        configure: suspend (RelaySessionManager.ManagedRelaySession, String) -> Unit = { _, _ -> },
+        configure: suspend (SmartRelaySession, String) -> Unit = { _, _ -> },
         block: suspend NwcSession.() -> T
     ): T {
         open(handleOutput, configure)

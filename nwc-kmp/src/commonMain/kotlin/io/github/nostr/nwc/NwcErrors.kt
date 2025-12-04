@@ -6,6 +6,7 @@ import nostr.core.session.EngineError
 
 internal fun Throwable.toFailure(): NwcFailure = when (this) {
     is NwcTimeoutException -> NwcFailure.Timeout(message)
+    is NwcNetworkException -> NwcFailure.Network(message, throwable = cause)
     is NwcEncryptionException -> NwcFailure.EncryptionUnsupported(message ?: "Encryption unsupported")
     is NwcRequestException -> NwcFailure.Wallet(error)
     is NwcProtocolException -> NwcFailure.Protocol(message ?: "Protocol violation")
@@ -48,8 +49,7 @@ internal fun NwcFailure.toException(): NwcException = when (this) {
             }
         }
         val messageWithDetail = if (detail.isEmpty()) base else "$base ($detail)"
-        throwable?.let { return NwcException(messageWithDetail, it) }
-        NwcException(messageWithDetail)
+        NwcNetworkException(messageWithDetail, throwable)
     }
     is NwcFailure.Timeout -> NwcTimeoutException(message ?: "Request timed out")
     is NwcFailure.Wallet -> NwcRequestException(error)
