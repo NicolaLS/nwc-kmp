@@ -36,7 +36,6 @@ kotlin {
                 implementation(libs.nostr.crypto)
                 implementation(libs.nip44)
                 implementation(libs.nip04)
-                implementation(libs.nip42)
                 implementation(libs.kotlinx.serialization.json)
                 implementation(libs.ktor.client.core.v331)
                 implementation(libs.ktor.client.websockets.v331)

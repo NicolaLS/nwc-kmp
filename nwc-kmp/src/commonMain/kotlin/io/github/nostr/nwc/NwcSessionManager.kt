@@ -10,7 +10,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import nostr.core.session.RelaySessionOutput
 import nostr.core.session.RelaySessionSettings
-import nostr.runtime.coroutines.RelaySessionManager
+import nostr.runtime.coroutines.SmartRelaySession
 
 class NwcSessionManager private constructor(
     private val scope: CoroutineScope,
@@ -28,21 +28,21 @@ class NwcSessionManager private constructor(
         uri: String,
         autoOpen: Boolean = false,
         handleOutput: suspend (String, RelaySessionOutput) -> Unit = { _, _ -> },
-        configure: suspend (RelaySessionManager.ManagedRelaySession, String) -> Unit = { _, _ -> }
+        configure: suspend (SmartRelaySession, String) -> Unit = { _, _ -> }
     ): NwcSession = acquire(NwcUri.parse(uri), autoOpen, handleOutput, configure)
 
     suspend fun acquire(
         uri: NwcUri,
         autoOpen: Boolean = false,
         handleOutput: suspend (String, RelaySessionOutput) -> Unit = { _, _ -> },
-        configure: suspend (RelaySessionManager.ManagedRelaySession, String) -> Unit = { _, _ -> }
+        configure: suspend (SmartRelaySession, String) -> Unit = { _, _ -> }
     ): NwcSession = acquire(uri.toCredentials(), autoOpen, handleOutput, configure)
 
     suspend fun acquire(
         credentials: NwcCredentials,
         autoOpen: Boolean = false,
         handleOutput: suspend (String, RelaySessionOutput) -> Unit = { _, _ -> },
-        configure: suspend (RelaySessionManager.ManagedRelaySession, String) -> Unit = { _, _ -> }
+        configure: suspend (SmartRelaySession, String) -> Unit = { _, _ -> }
     ): NwcSession {
         val key = canonicalKey(credentials)
         val (session, newlyCreated) = mutex.withLock {
@@ -62,7 +62,12 @@ class NwcSessionManager private constructor(
             created to true
         }
         if (autoOpen && newlyCreated) {
-            session.open(handleOutput, configure)
+            try {
+                session.open(handleOutput, configure)
+            } catch (failure: Throwable) {
+                mutex.withLock { sessions.remove(key) }
+                throw failure
+            }
         }
         return session
     }
