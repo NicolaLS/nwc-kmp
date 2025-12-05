@@ -1,6 +1,7 @@
 package io.github.nostr.nwc.testing
 
 import io.github.nostr.nwc.NwcClientContract
+import io.github.nostr.nwc.NwcRequest
 import io.github.nostr.nwc.model.BalanceResult
 import io.github.nostr.nwc.model.GetInfoResult
 import io.github.nostr.nwc.model.KeysendParams
@@ -12,6 +13,7 @@ import io.github.nostr.nwc.model.MultiKeysendItem
 import io.github.nostr.nwc.model.MultiPayInvoiceItem
 import io.github.nostr.nwc.model.MultiResult
 import io.github.nostr.nwc.model.NwcFailure
+import io.github.nostr.nwc.model.NwcRequestState
 import io.github.nostr.nwc.model.NwcResult
 import io.github.nostr.nwc.model.NwcWalletDescriptor
 import io.github.nostr.nwc.model.PayInvoiceParams
@@ -19,12 +21,14 @@ import io.github.nostr.nwc.model.PayInvoiceResult
 import io.github.nostr.nwc.model.Transaction
 import io.github.nostr.nwc.model.WalletMetadata
 import io.github.nostr.nwc.model.WalletNotification
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.random.Random
 
 /**
  * Lightweight in-memory implementation of [NwcClientContract] for consumer unit tests.
@@ -142,5 +146,60 @@ class FakeNwcClient(
         lookupInvoice.reset()
         listTransactions.reset()
         closeCount = 0
+    }
+
+    // ==================== Flow-based Request API ====================
+
+    /**
+     * Helper to create an NwcRequest from a stubbed result.
+     * The request immediately transitions to Success/Failure state.
+     */
+    private fun <T> createFakeRequest(result: NwcResult<T>): NwcRequest<T> {
+        val state = when (result) {
+            is NwcResult.Success -> NwcRequestState.Success(result.value)
+            is NwcResult.Failure -> NwcRequestState.Failure(result.failure)
+        }
+        val stateFlow = MutableStateFlow<NwcRequestState<T>>(state)
+        val requestId = "fake-${Random.nextLong().toString(16)}"
+        return NwcRequest(
+            state = stateFlow,
+            requestId = requestId,
+            job = Job().apply { complete() } // Already completed
+        )
+    }
+
+    override fun payInvoiceRequest(params: PayInvoiceParams): NwcRequest<PayInvoiceResult> {
+        val result = payInvoice.record(params, Long.MAX_VALUE)
+        return createFakeRequest(result)
+    }
+
+    override fun payKeysendRequest(params: KeysendParams): NwcRequest<KeysendResult> {
+        val result = payKeysend.record(params, Long.MAX_VALUE)
+        return createFakeRequest(result)
+    }
+
+    override fun getBalanceRequest(): NwcRequest<BalanceResult> {
+        val result = getBalance.record(Long.MAX_VALUE)
+        return createFakeRequest(result)
+    }
+
+    override fun getInfoRequest(): NwcRequest<GetInfoResult> {
+        val result = getInfo.record(Long.MAX_VALUE)
+        return createFakeRequest(result)
+    }
+
+    override fun makeInvoiceRequest(params: MakeInvoiceParams): NwcRequest<Transaction> {
+        val result = makeInvoice.record(params, Long.MAX_VALUE)
+        return createFakeRequest(result)
+    }
+
+    override fun lookupInvoiceRequest(params: LookupInvoiceParams): NwcRequest<Transaction> {
+        val result = lookupInvoice.record(params, Long.MAX_VALUE)
+        return createFakeRequest(result)
+    }
+
+    override fun listTransactionsRequest(params: ListTransactionsParams): NwcRequest<List<Transaction>> {
+        val result = listTransactions.record(params, Long.MAX_VALUE)
+        return createFakeRequest(result)
     }
 }
