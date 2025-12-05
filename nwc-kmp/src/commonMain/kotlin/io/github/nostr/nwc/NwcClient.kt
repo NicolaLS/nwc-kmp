@@ -35,6 +35,7 @@ import io.github.nostr.nwc.model.Network
 import io.github.nostr.nwc.model.NwcError
 import io.github.nostr.nwc.model.NwcCapability
 import io.github.nostr.nwc.model.NwcNotificationType
+import io.github.nostr.nwc.model.NwcRequestState
 import io.github.nostr.nwc.model.NwcResult
 import io.github.nostr.nwc.model.NwcWalletDescriptor
 import io.github.nostr.nwc.model.PayInvoiceParams
@@ -450,6 +451,63 @@ class NwcClient private constructor(
         }
     }
 
+    // ==================== Flow-based Request Helpers ====================
+
+    /**
+     * Maximum timeout for Flow-based requests that wait indefinitely.
+     * 10 minutes should be sufficient for even slow Lightning payments.
+     */
+    private val MAX_REQUEST_WAIT_MS = 600_000L
+
+    /**
+     * Generic helper that creates an [NwcRequest] for observing request state.
+     *
+     * Unlike [execute], this returns immediately with a controllable request handle.
+     * The request waits for a response indefinitely (up to [MAX_REQUEST_WAIT_MS])
+     * until cancelled or completed.
+     *
+     * @param method The NWC method name
+     * @param buildParams Builder for request parameters
+     * @param parseResult Parser for the response JSON
+     * @return [NwcRequest] wrapping a [StateFlow] of [NwcRequestState]
+     */
+    private fun <R> executeAsRequest(
+        method: String,
+        buildParams: JsonObjectBuilder.() -> Unit = {},
+        parseResult: (JsonObject) -> R
+    ): NwcRequest<R> {
+        val stateFlow = MutableStateFlow<NwcRequestState<R>>(NwcRequestState.Loading)
+
+        val job = scope.launch {
+            try {
+                if (hasInterceptors) {
+                    val params = buildJsonObject(buildParams)
+                    interceptors.forEach { it.onRequest(method, params) }
+                }
+                val params = buildJsonObject(buildParams)
+                val response = sendSingleRequest(method, params, MAX_REQUEST_WAIT_MS)
+                val obj = response.result as? JsonObject
+                    ?: throw NwcProtocolException("$method response missing result object")
+                val result = parseResult(obj)
+                stateFlow.value = NwcRequestState.Success(result)
+            } catch (e: Throwable) {
+                stateFlow.value = NwcRequestState.Failure(e.toFailure())
+            }
+        }
+
+        // Get request ID - we build event just to get its ID for tracking
+        // This is a bit wasteful but keeps the API simple
+        val requestId = runCatching {
+            buildRequestEvent(method, buildJsonObject(buildParams), null).id
+        }.getOrDefault("unknown")
+
+        return NwcRequest(
+            state = stateFlow,
+            requestId = requestId,
+            job = job
+        )
+    }
+
     // ==================== API Methods ====================
 
     override suspend fun getBalance(timeoutMillis: Long): NwcResult<BalanceResult> = runNwcCatching {
@@ -652,6 +710,179 @@ class NwcClient private constructor(
             lud16 = credentials.lud16
         )
     }
+
+    // ==================== Flow-based API Methods ====================
+    //
+    // These methods return [NwcRequest] wrappers that allow consumers to:
+    // - Observe request state via StateFlow (Loading → Success/Failure)
+    // - Control how long to wait (no library-enforced timeout)
+    // - Cancel and cleanup resources when done
+    //
+    // Use these for operations where the wallet may be slow to respond (e.g., payments).
+
+    /**
+     * Initiates a payment and returns an observable request handle.
+     *
+     * Unlike [payInvoice], this returns immediately and does not enforce a timeout.
+     * Consumers can observe [NwcRequest.state] to track progress and decide
+     * how long to wait.
+     *
+     * Example:
+     * ```kotlin
+     * val request = client.payInvoiceRequest(params)
+     *
+     * // Wait up to 30 seconds, then show "pending" UI
+     * val result = request.awaitResult(30.seconds)
+     * when (result) {
+     *     is NwcRequestState.Success -> showSuccess(result.value)
+     *     is NwcRequestState.Failure -> showError(result.failure)
+     *     null, NwcRequestState.Loading -> {
+     *         showPendingUI() // Still waiting, but show user it's pending
+     *         // Continue observing if desired:
+     *         request.state.collect { ... }
+     *     }
+     * }
+     *
+     * // When done (e.g., user navigates away):
+     * request.cancel()
+     * ```
+     *
+     * @param params Payment parameters (invoice, optional amount override, metadata)
+     * @return [NwcRequest] for observing payment progress
+     */
+    override fun payInvoiceRequest(params: PayInvoiceParams): NwcRequest<PayInvoiceResult> =
+        executeAsRequest(
+            MethodNames.PAY_INVOICE,
+            buildParams = {
+                put("invoice", params.invoice)
+                params.amount?.let { put("amount", it.msats) }
+                params.metadata?.let { put("metadata", it) }
+            }
+        ) { obj -> parsePaymentResult(obj, "pay_invoice") }
+
+    /**
+     * Initiates a keysend payment and returns an observable request handle.
+     *
+     * @param params Keysend parameters (destination pubkey, amount, optional TLV records)
+     * @return [NwcRequest] for observing payment progress
+     * @see payInvoiceRequest for usage example
+     */
+    override fun payKeysendRequest(params: KeysendParams): NwcRequest<KeysendResult> =
+        executeAsRequest(
+            MethodNames.PAY_KEYSEND,
+            buildParams = {
+                put("pubkey", params.destinationPubkey)
+                put("amount", params.amount.msats)
+                params.preimage?.let { put("preimage", it) }
+                if (params.tlvRecords.isNotEmpty()) {
+                    put("tlv_records", buildJsonArray {
+                        params.tlvRecords.forEach { record ->
+                            add(buildJsonObject {
+                                put("type", record.type)
+                                put("value", record.valueHex)
+                            })
+                        }
+                    })
+                }
+            }
+        ) { obj -> parsePaymentResult(obj, "pay_keysend") }
+
+    /**
+     * Fetches wallet balance and returns an observable request handle.
+     *
+     * @return [NwcRequest] for observing the balance request
+     */
+    override fun getBalanceRequest(): NwcRequest<BalanceResult> =
+        executeAsRequest(MethodNames.GET_BALANCE) { obj ->
+            val balanceMsats = obj["balance"]?.jsonPrimitive?.longValueOrNull()
+                ?: throw NwcProtocolException("get_balance response missing balance")
+            BalanceResult(BitcoinAmount.fromMsats(balanceMsats))
+        }
+
+    /**
+     * Fetches wallet info and returns an observable request handle.
+     *
+     * @return [NwcRequest] for observing the info request
+     */
+    override fun getInfoRequest(): NwcRequest<GetInfoResult> =
+        executeAsRequest(MethodNames.GET_INFO) { obj ->
+            val rawPubkey = obj.string("pubkey")
+            val pubkey = if (rawPubkey.isNullOrBlank()) {
+                credentials.walletPublicKeyHex
+            } else {
+                rawPubkey
+            }
+            GetInfoResult(
+                alias = obj.string("alias"),
+                color = obj.string("color"),
+                pubkey = pubkey,
+                network = Network.fromWire(obj.string("network")),
+                blockHeight = obj["block_height"]?.jsonPrimitive?.longValueOrNull(),
+                blockHash = obj.string("block_hash"),
+                methods = obj.jsonArrayOrNull("methods")
+                    ?.mapNotNull { NwcCapability.fromWire(it.asString()) }?.toSet() ?: emptySet(),
+                notifications = obj.jsonArrayOrNull("notifications")
+                    ?.mapNotNull { NwcNotificationType.fromWire(it.asString()) }?.toSet() ?: emptySet()
+            )
+        }
+
+    /**
+     * Creates an invoice and returns an observable request handle.
+     *
+     * @param params Invoice parameters (amount, description, expiry)
+     * @return [NwcRequest] for observing invoice creation
+     */
+    override fun makeInvoiceRequest(params: MakeInvoiceParams): NwcRequest<Transaction> =
+        executeAsRequest(
+            MethodNames.MAKE_INVOICE,
+            buildParams = {
+                put("amount", params.amount.msats)
+                params.description?.let { put("description", it) }
+                params.descriptionHash?.let { put("description_hash", it) }
+                params.expirySeconds?.let { put("expiry", it) }
+            }
+        ) { obj -> parseTransaction(obj) }
+
+    /**
+     * Looks up an invoice and returns an observable request handle.
+     *
+     * @param params Lookup parameters (payment hash or bolt11 invoice)
+     * @return [NwcRequest] for observing the lookup
+     */
+    override fun lookupInvoiceRequest(params: LookupInvoiceParams): NwcRequest<Transaction> =
+        executeAsRequest(
+            MethodNames.LOOKUP_INVOICE,
+            buildParams = {
+                params.paymentHash?.let { put("payment_hash", it) }
+                params.invoice?.let { put("invoice", it) }
+            }
+        ) { obj -> parseTransaction(obj) }
+
+    /**
+     * Lists transactions and returns an observable request handle.
+     *
+     * @param params Filter/pagination parameters
+     * @return [NwcRequest] for observing the transaction list
+     */
+    override fun listTransactionsRequest(params: ListTransactionsParams): NwcRequest<List<Transaction>> =
+        executeAsRequest(
+            MethodNames.LIST_TRANSACTIONS,
+            buildParams = {
+                params.fromTimestamp?.let { put("from", it) }
+                params.untilTimestamp?.let { put("until", it) }
+                params.limit?.let { put("limit", it) }
+                params.offset?.let { put("offset", it) }
+                if (params.includeUnpaidInvoices) put("unpaid", true)
+                params.type?.let { put("type", it.toWire()) }
+            }
+        ) { obj ->
+            val array = obj.jsonArrayOrNull("transactions") ?: JsonArray(emptyList())
+            array.map { element ->
+                val txnObj = element as? JsonObject
+                    ?: throw NwcProtocolException("list_transactions entry must be object")
+                parseTransaction(txnObj)
+            }
+        }
 
     // ==================== Background Initialization ====================
 
@@ -1014,8 +1245,9 @@ class NwcClient private constructor(
                 }
             }
 
-            // All relays failed - prefer ConnectionFailed over Timeout (more specific)
-            failures.firstOrNull { it is RequestResult.ConnectionFailed }
+            // All relays failed - prefer Timeout over ConnectionFailed
+            // When user sets a timeout, they care about whether it timed out, not transient connection issues
+            failures.firstOrNull { it is RequestResult.Timeout }
                 ?: failures.firstOrNull()
                 ?: RequestResult.Timeout(timeoutMillis)
         }
