@@ -125,14 +125,22 @@ private const val NOTIFICATION_BUFFER_CAPACITY = 64
  * Retry config for NWC foreground operations.
  * - staleTimeoutThreshold=1: Single timeout while connected triggers reconnect (aggressive stale detection)
  * - maxRetries=1: One retry after stale detection (we race relays, so per-relay retries are limited)
- * - writeTimeoutMillis=3000: Await write confirmation to detect dead connections fast
- * - checkNetworkBeforeRequest=true: Fail immediately if device is offline
+ * - writeTimeoutMillis=null: Disabled because write confirmation timeout doesn't mean write failed -
+ *   the request may have been sent but confirmation was slow. This was causing false "network error"
+ *   returns even when the payment actually went through.
+ * - checkNetworkBeforeRequest=false: Disabled due to unreliable Android NetworkInterface API causing
+ *   false "offline" errors even when network is working.
+ *
+ * TODO: Create upstream issue in nostr-kmp to improve foreground reliability:
+ *       1. checkNetworkBeforeRequest should skip check when already connected
+ *       2. writeTimeoutMillis should differentiate "write definitely failed" vs "confirmation timed out"
+ *       3. Consider using Android ConnectivityManager instead of NetworkInterface (requires Context)
  */
 private val NwcRetryConfig = EagerRetryConfig(
     maxRetries = 1,
     staleTimeoutThreshold = 1,
-    writeTimeoutMillis = 3000,
-    checkNetworkBeforeRequest = true
+    writeTimeoutMillis = null,
+    checkNetworkBeforeRequest = false
 )
 
 /** Timeout for subscription setup per relay during initialization */
@@ -921,7 +929,7 @@ class NwcClient private constructor(
                         relay = handle.url,
                         filters = listOf(responseFilter),
                         timeoutMillis = SUBSCRIPTION_SETUP_TIMEOUT_MS,
-                        checkNetwork = true
+                        checkNetwork = false  // Disabled: unreliable Android NetworkInterface API
                     )
                     handle.url to (subscription != null)
                 }
@@ -1041,7 +1049,7 @@ class NwcClient private constructor(
                         relay = relay,
                         filters = listOf(responseFilter),
                         timeoutMillis = SUBSCRIPTION_SETUP_TIMEOUT_MS,
-                        checkNetwork = true
+                        checkNetwork = false  // Disabled: unreliable Android NetworkInterface API
                     )
 
                     if (subscription != null) {
