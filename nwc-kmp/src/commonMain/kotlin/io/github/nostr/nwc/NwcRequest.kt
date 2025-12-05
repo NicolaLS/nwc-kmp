@@ -128,4 +128,18 @@ class NwcRequest<T> internal constructor(
             )
         }
     }
+
+    companion object {
+        /**
+         * Create an NwcRequest for testing purposes.
+         *
+         * This allows test code to construct fake NwcRequest instances
+         * without accessing internal constructors.
+         */
+        fun <T> createForTest(
+            state: StateFlow<NwcRequestState<T>>,
+            requestId: String = "test-request",
+            job: Job = Job()
+        ): NwcRequest<T> = NwcRequest(state, requestId, job)
+    }
 }
