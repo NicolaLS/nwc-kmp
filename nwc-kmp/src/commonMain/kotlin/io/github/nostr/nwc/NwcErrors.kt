@@ -11,7 +11,9 @@ internal fun Throwable.toFailure(): NwcFailure = when (this) {
     is NwcRequestException -> NwcFailure.Wallet(error)
     is NwcProtocolException -> NwcFailure.Protocol(message ?: "Protocol violation")
     is NwcException -> NwcFailure.Unknown(message, cause)
-    else -> NwcFailure.Network(message, throwable = this)
+    // Don't classify unknown exceptions as Network - they could be parsing errors,
+    // serialization bugs, etc. Use Unknown to avoid misleading "network error" messages.
+    else -> NwcFailure.Unknown(message, this)
 }
 
 internal fun EngineError.toFailure(): NwcFailure = when (this) {

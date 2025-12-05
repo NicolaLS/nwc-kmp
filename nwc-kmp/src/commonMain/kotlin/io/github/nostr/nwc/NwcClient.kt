@@ -971,6 +971,14 @@ class NwcClient private constructor(
             } catch (e: Throwable) {
                 NwcLog.error(logTag, e) { "Background initialization failed" }
                 initState.value = InitState.Failed(e)
+                // Launch recovery even when session.open() fails (e.g., offline at startup)
+                // This ensures we can recover when network becomes available
+                val responseFilter = Filter(
+                    kinds = setOf(RESPONSE_KIND),
+                    authors = setOf(walletPublicKeyHex),
+                    tags = mapOf("#$TAG_P" to setOf(clientPublicKeyHex))
+                )
+                launchRecoveryTask(credentials.relays.toSet(), responseFilter)
             }
         }
     }
@@ -979,41 +987,76 @@ class NwcClient private constructor(
      * Waits for initialization to be ready enough for requests.
      * Called at the start of each request method.
      *
-     * If init previously failed due to network unavailability, retries initialization
-     * since network may now be available.
+     * If init previously failed or is failing, keeps retrying within the timeout budget.
+     * This handles the case where the client was created offline and network comes back later.
      *
      * @param timeoutMillis Maximum time to wait for initialization
      * @return List of session handles that are ready for requests
-     * @throws NwcNetworkException if initialization failed
+     * @throws NwcNetworkException if initialization failed and couldn't recover within timeout
      * @throws NwcTimeoutException if initialization didn't complete in time
      */
     private suspend fun awaitReady(timeoutMillis: Long): List<NwcSessionRuntime.SessionHandle> {
-        val current = initState.value
-        if (current is InitState.Failed) {
-            NwcLog.info(logTag) { "Init previously failed; retrying initialization before serving request" }
-            initState.value = InitState.NotStarted
-            startBackgroundInit()
-        } else if (current is InitState.NotStarted) {
-            startBackgroundInit()
+        val startTime = kotlin.time.TimeSource.Monotonic.markNow()
+        var lastError: Throwable? = null
+
+        while (startTime.elapsedNow().inWholeMilliseconds < timeoutMillis) {
+            val remaining = timeoutMillis - startTime.elapsedNow().inWholeMilliseconds
+            if (remaining <= 0) break
+
+            val current = initState.value
+            if (current is InitState.Failed) {
+                lastError = current.error
+                NwcLog.info(logTag) { "Init previously failed; retrying initialization" }
+                initState.value = InitState.NotStarted
+                startBackgroundInit()
+            } else if (current is InitState.NotStarted) {
+                startBackgroundInit()
+            }
+
+            val state = withTimeoutOrNull(remaining) {
+                initState.first { it is InitState.Ready || it is InitState.PartialReady || it is InitState.Failed }
+            }
+
+            when (state) {
+                is InitState.Ready -> {
+                    return session.runtimeHandles.filter {
+                        state.readyRelays.contains(it.url) && it.responseSubscription != null
+                    }
+                }
+                is InitState.PartialReady -> {
+                    return session.runtimeHandles.filter {
+                        state.readyRelays.contains(it.url) && it.responseSubscription != null
+                    }
+                }
+                is InitState.Failed -> {
+                    lastError = state.error
+                    // Don't give up immediately - wait a bit and retry if we have time budget left
+                    val retryDelay = 500L
+                    if (startTime.elapsedNow().inWholeMilliseconds + retryDelay < timeoutMillis) {
+                        NwcLog.debug(logTag) { "Init failed, retrying in ${retryDelay}ms..." }
+                        delay(retryDelay)
+                        continue
+                    }
+                }
+                null -> {
+                    // Timeout waiting for state change
+                    break
+                }
+                else -> {
+                    // Still initializing, continue waiting
+                    continue
+                }
+            }
         }
 
-        val state = withTimeoutOrNull(timeoutMillis) {
-            initState.first { it is InitState.Ready || it is InitState.PartialReady || it is InitState.Failed }
-        } ?: throw NwcTimeoutException("Timed out waiting for client initialization after ${timeoutMillis}ms")
-
-        return when (state) {
-            is InitState.Ready -> session.runtimeHandles.filter {
-                state.readyRelays.contains(it.url) && it.responseSubscription != null
-            }
-            is InitState.PartialReady -> session.runtimeHandles.filter {
-                state.readyRelays.contains(it.url) && it.responseSubscription != null
-            }
-            is InitState.Failed -> throw NwcNetworkException(
-                "Client initialization failed: ${state.error.message}",
-                state.error
+        // Exhausted timeout budget
+        if (lastError != null) {
+            throw NwcNetworkException(
+                "Client initialization failed after ${timeoutMillis}ms: ${lastError.message}",
+                lastError
             )
-            else -> throw NwcNetworkException("Unexpected init state: $state", null)
         }
+        throw NwcTimeoutException("Timed out waiting for client initialization after ${timeoutMillis}ms")
     }
 
     /**
