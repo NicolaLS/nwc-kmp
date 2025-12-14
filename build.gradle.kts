@@ -1,7 +1,7 @@
 import com.vanniktech.maven.publish.MavenPublishBaseExtension
 
 val groupId = "io.github.nicolals"
-val versionName = "0.1.2-SNAPSHOT"
+val versionName = "0.2.0-SNAPSHOT"
 
 plugins {
     id("com.android.library") version "8.12.3" apply false
