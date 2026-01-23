@@ -1,12 +1,12 @@
 import com.vanniktech.maven.publish.MavenPublishBaseExtension
 
 val groupId = "io.github.nicolals"
-val versionName = "0.2.0-SNAPSHOT"
+val versionName = "0.2.1-SNAPSHOT"
 
 plugins {
     id("com.android.library") version "8.12.3" apply false
     id("com.android.kotlin.multiplatform.library") version "8.12.3" apply false
-    id("org.jetbrains.kotlin.multiplatform") version "2.2.20" apply false
+    id("org.jetbrains.kotlin.multiplatform") version "2.2.21" apply false
     id("com.vanniktech.maven.publish") version "0.34.0" apply false
 }
 
