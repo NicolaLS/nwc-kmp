@@ -1,6 +1,6 @@
 [versions]
-agp = "8.12.3"
-kotlin = "2.2.21"
+agp = "8.13.0"
+kotlin = "2.3.0"
 android-minSdk = "24"
 android-compileSdk = "36"
 ktorClientCore = "3.3.3"
@@ -23,6 +23,7 @@ ktor-client-websockets-v331 = { module = "io.ktor:ktor-client-websockets", versi
 nip04 = { module = "io.github.nicolals:nostr-nip04", version.ref = "nostr-kmp" }
 nip42 = { module = "io.github.nicolals:nostr-nip42", version.ref = "nostr-kmp" }
 nip44 = { module = "io.github.nicolals:nostr-nip44", version.ref = "nostr-kmp" }
+nip47 = { module = "io.github.nicolals:nostr-nip47", version.ref = "nostr-kmp" }
 nostr-codec-kotlinx-serialization = { module = "io.github.nicolals:nostr-codec-kotlinx-serialization", version.ref = "nostr-kmp" }
 nostr-core = { module = "io.github.nicolals:nostr-core", version.ref = "nostr-kmp" }
 nostr-crypto = { module = "io.github.nicolals:nostr-crypto", version.ref = "nostr-kmp" }

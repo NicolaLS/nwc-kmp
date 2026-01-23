@@ -29,16 +29,17 @@ kotlin {
         val commonMain by getting {
             dependencies {
                 implementation(libs.kotlinx.coroutines.core)
-                implementation(libs.nostr.core)
+                // nostr-core types (PublicKey) are exposed in public API
+                api(libs.nostr.core)
                 implementation(libs.nostr.codec.kotlinx.serialization)
                 implementation(libs.nostr.runtime.coroutines)
                 implementation(libs.nostr.transport.ktor)
                 implementation(libs.nostr.crypto)
                 implementation(libs.nip44)
                 implementation(libs.nip04)
-                implementation(libs.kotlinx.serialization.json)
+                // NIP-47 types (NwcEncryption) are exposed in public API
+                api(libs.nip47)
                 implementation(libs.ktor.client.core.v331)
-                implementation(libs.ktor.client.websockets.v331)
             }
         }
 
@@ -70,7 +71,7 @@ kotlin {
 }
 
 android {
-    namespace = "io.github.nostr.nwc"
+    namespace = "io.github.nicolals.nwc"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
     defaultConfig {
         minSdk = libs.versions.android.minSdk.get().toInt()
