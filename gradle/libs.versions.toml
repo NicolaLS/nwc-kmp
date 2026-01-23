@@ -1,0 +1,35 @@
+[versions]
+agp = "8.12.3"
+kotlin = "2.2.21"
+android-minSdk = "24"
+android-compileSdk = "36"
+ktorClientCore = "3.3.3"
+ktorClientWebsockets = "3.3.3"
+nostr-kmp = "0.2.1-SNAPSHOT"
+vanniktechMavenPublish = "0.34.0"
+kotlin-serialization = "1.9.0"
+kotlinx-coroutines = "1.10.2"
+ktor = "3.3.3"
+
+[libraries]
+kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlin-serialization" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinx-coroutines" }
+kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "kotlinx-coroutines" }
+ktor-client-core-v331 = { module = "io.ktor:ktor-client-core", version.ref = "ktorClientCore" }
+ktor-client-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor" }
+ktor-client-darwin = { module = "io.ktor:ktor-client-darwin", version.ref = "ktor" }
+ktor-client-websockets-v331 = { module = "io.ktor:ktor-client-websockets", version.ref = "ktorClientWebsockets" }
+nip04 = { module = "io.github.nicolals:nostr-nip04", version.ref = "nostr-kmp" }
+nip42 = { module = "io.github.nicolals:nostr-nip42", version.ref = "nostr-kmp" }
+nip44 = { module = "io.github.nicolals:nostr-nip44", version.ref = "nostr-kmp" }
+nostr-codec-kotlinx-serialization = { module = "io.github.nicolals:nostr-codec-kotlinx-serialization", version.ref = "nostr-kmp" }
+nostr-core = { module = "io.github.nicolals:nostr-core", version.ref = "nostr-kmp" }
+nostr-crypto = { module = "io.github.nicolals:nostr-crypto", version.ref = "nostr-kmp" }
+nostr-runtime-coroutines = { module = "io.github.nicolals:nostr-runtime-coroutines", version.ref = "nostr-kmp" }
+nostr-transport-ktor = { module = "io.github.nicolals:nostr-transport-ktor", version.ref = "nostr-kmp" }
+
+[plugins]
+androidLibrary = { id = "com.android.library", version.ref = "agp" }
+kotlinMultiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+vanniktech-mavenPublish = { id = "com.vanniktech.maven.publish", version.ref = "vanniktechMavenPublish" }
