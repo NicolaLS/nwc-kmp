@@ -228,9 +228,15 @@ class NwcClient private constructor(
      * 2. Fetch the wallet info event
      * 3. Subscribe to response events
      * 4. Optionally subscribe to notifications
+     *
+     * If the client is already connected or connecting, this call does nothing unless
+     * forceReconnect is true.
      */
-    fun connect() {
-        if (_state.value != NwcClientState.Disconnected) return
+    fun connect(forceReconnect: Boolean = false) {
+        val currentState = _state.value
+        if (!forceReconnect && (currentState == NwcClientState.Ready || currentState == NwcClientState.Connecting)) {
+            return
+        }
 
         _state.value = NwcClientState.Connecting
 
@@ -852,10 +858,45 @@ class NwcClient private constructor(
         _notifications.tryEmit(walletNotification)
     }
 
+    private suspend fun ensureConnected(timeoutMs: Long): Boolean {
+        // If already ready, return immediately
+        if (_state.value == NwcClientState.Ready) return true
+
+        // If disconnected or failed, trigger connection
+        val currentState = _state.value
+        if (currentState == NwcClientState.Disconnected || currentState is NwcClientState.Failed) {
+            connect(forceReconnect = true)
+        }
+
+        // Wait for Ready state
+        return try {
+            withTimeoutOrNull(timeoutMs) {
+                _state.first { it == NwcClientState.Ready || it is NwcClientState.Failed }
+            } == NwcClientState.Ready
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     private suspend fun executeRequest(
         request: NwcRequest,
         timeoutMs: Long,
     ): io.github.nicolals.nwc.NwcResult<NwcResponse> {
+        // Ensure we are connected before proceeding
+        // Use a portion of the total timeout for connection establishment (e.g., 10s or 20% of timeout)
+        val connectionTimeout = minOf(10_000L, timeoutMs)
+        if (!ensureConnected(connectionTimeout)) {
+            val state = _state.value
+            val message = if (state is NwcClientState.Failed) {
+                state.error.message
+            } else {
+                "Failed to establish connection to relay"
+            }
+            return io.github.nicolals.nwc.NwcResult.failure(
+                io.github.nicolals.nwc.NwcError.ConnectionError(message)
+            )
+        }
+        
         val currentSession = session ?: return io.github.nicolals.nwc.NwcResult.failure(
             io.github.nicolals.nwc.NwcError.ConnectionError("Not connected")
         )
@@ -1040,6 +1081,20 @@ class NwcClient private constructor(
         itemIds: List<String>,
         timeoutMs: Long,
     ): io.github.nicolals.nwc.NwcResult<Map<String, NwcResponse>> {
+        // Ensure we are connected before proceeding
+        val connectionTimeout = minOf(10_000L, timeoutMs)
+        if (!ensureConnected(connectionTimeout)) {
+            val state = _state.value
+            val message = if (state is NwcClientState.Failed) {
+                state.error.message
+            } else {
+                "Failed to establish connection to relay"
+            }
+            return io.github.nicolals.nwc.NwcResult.failure(
+                io.github.nicolals.nwc.NwcError.ConnectionError(message)
+            )
+        }
+
         val currentSession = session ?: return io.github.nicolals.nwc.NwcResult.failure(
             io.github.nicolals.nwc.NwcError.ConnectionError("Not connected")
         )
@@ -1222,7 +1277,12 @@ class NwcClient private constructor(
             cachedWalletInfo: WalletInfo? = null,
         ): NwcClient {
             val transportFactory = KtorRelayTransportFactory(httpClient ?: HttpClient())
-            return NwcClient(uri, scope, transportFactory, cachedWalletInfo)
+            val client = NwcClient(uri, scope, transportFactory, cachedWalletInfo)
+            // Automatically start connecting when the client is created.
+            // This allows connection setup to run in parallel with UI/app logic.
+            // Operations will wait for connection if needed via ensureConnected().
+            client.connect()
+            return client
         }
 
         /**
