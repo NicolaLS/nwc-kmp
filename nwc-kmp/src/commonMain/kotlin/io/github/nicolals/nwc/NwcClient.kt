@@ -68,8 +68,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.time.TimeSource
 
 /**
  * Nostr Wallet Connect (NWC) client for Kotlin Multiplatform.
@@ -231,8 +233,11 @@ class NwcClient private constructor(
      *
      * If the client is already connected or connecting, this call does nothing unless
      * forceReconnect is true.
+     *
+     * @param forceReconnect If true, forces a new connection even if already connected/connecting.
+     * @param connectionTimeoutMs Timeout for the WebSocket connection establishment.
      */
-    fun connect(forceReconnect: Boolean = false) {
+    fun connect(forceReconnect: Boolean = false, connectionTimeoutMs: Long = DEFAULT_CONNECTION_TIMEOUT_MS) {
         val currentState = _state.value
         if (!forceReconnect && (currentState == NwcClientState.Ready || currentState == NwcClientState.Connecting)) {
             return
@@ -271,8 +276,8 @@ class NwcClient private constructor(
         // Launch initialization coroutine
         scope.launch {
             try {
-                // Wait for connection
-                val connected = newSession.awaitConnected(timeoutMs = 10_000)
+                // Wait for connection with configurable timeout
+                val connected = newSession.awaitConnected(timeoutMs = connectionTimeoutMs)
                 if (!connected) {
                     _state.value = NwcClientState.Failed(
                         io.github.nicolals.nwc.NwcError.ConnectionError("Failed to connect to relay")
@@ -862,19 +867,61 @@ class NwcClient private constructor(
         // If already ready, return immediately
         if (_state.value == NwcClientState.Ready) return true
 
-        // If disconnected or failed, trigger connection
-        val currentState = _state.value
-        if (currentState == NwcClientState.Disconnected || currentState is NwcClientState.Failed) {
-            connect(forceReconnect = true)
-        }
+        // Retry connection establishment with exponential backoff.
+        // This handles transient failures (DNS hiccups, relay temporarily unreachable,
+        // packet loss during handshake, iOS network stack issues after backgrounding, etc.)
+        // without requiring auto-reconnection at the session level (which wouldn't help
+        // recover in-flight NWC requests anyway since events are ephemeral).
+        val timeMark = TimeSource.Monotonic.markNow()
+        var attempt = 0
 
-        // Wait for Ready state
-        return try {
-            withTimeoutOrNull(timeoutMs) {
-                _state.first { it == NwcClientState.Ready || it is NwcClientState.Failed }
-            } == NwcClientState.Ready
-        } catch (e: Exception) {
-            false
+        while (true) {
+            attempt++
+            val elapsed = timeMark.elapsedNow().inWholeMilliseconds
+            val remaining = timeoutMs - elapsed
+
+            // Check if we've exhausted our timeout budget
+            if (remaining <= 0) return false
+
+            // If disconnected or failed, trigger connection with appropriate timeout
+            val currentState = _state.value
+            if (currentState == NwcClientState.Disconnected || currentState is NwcClientState.Failed) {
+                // Use shorter per-attempt timeout to leave room for retries
+                val perAttemptTimeout = minOf(remaining, CONNECTION_ATTEMPT_TIMEOUT_MS)
+                connect(forceReconnect = true, connectionTimeoutMs = perAttemptTimeout)
+            }
+
+            // Wait for Ready state
+            val waitTimeout = minOf(remaining, CONNECTION_ATTEMPT_TIMEOUT_MS + WALLET_INFO_TIMEOUT_MS)
+            val ready = try {
+                withTimeoutOrNull(waitTimeout) {
+                    _state.first { it == NwcClientState.Ready || it is NwcClientState.Failed }
+                } == NwcClientState.Ready
+            } catch (e: Exception) {
+                false
+            }
+
+            if (ready) return true
+
+            // Connection failed - check if we should retry
+            val newElapsed = timeMark.elapsedNow().inWholeMilliseconds
+            val newRemaining = timeoutMs - newElapsed
+
+            // Need minimum time for another attempt, and respect max attempts
+            if (newRemaining < MIN_RETRY_BUDGET_MS || attempt >= MAX_CONNECTION_ATTEMPTS) {
+                return false
+            }
+
+            // Exponential backoff: 500ms, 1000ms, 2000ms, capped at 3000ms
+            val backoffMs = minOf(
+                CONNECTION_BACKOFF_BASE_MS * (1L shl (attempt - 1)),
+                CONNECTION_BACKOFF_MAX_MS
+            )
+            // Don't backoff longer than remaining time minus minimum for next attempt
+            val actualBackoff = minOf(backoffMs, newRemaining - MIN_RETRY_BUDGET_MS)
+            if (actualBackoff > 0) {
+                delay(actualBackoff)
+            }
         }
     }
 
@@ -883,8 +930,14 @@ class NwcClient private constructor(
         timeoutMs: Long,
     ): io.github.nicolals.nwc.NwcResult<NwcResponse> {
         // Ensure we are connected before proceeding
-        // Use a portion of the total timeout for connection establishment (e.g., 10s or 20% of timeout)
-        val connectionTimeout = minOf(10_000L, timeoutMs)
+        // Give generous time for connection establishment with retries.
+        // For short timeouts, use up to half; for longer timeouts, cap at 15s to leave
+        // enough time for the actual request/response cycle.
+        val connectionTimeout = when {
+            timeoutMs <= 10_000L -> timeoutMs / 2
+            timeoutMs <= 30_000L -> minOf(15_000L, timeoutMs / 2)
+            else -> 15_000L
+        }
         if (!ensureConnected(connectionTimeout)) {
             val state = _state.value
             val message = if (state is NwcClientState.Failed) {
@@ -1082,7 +1135,12 @@ class NwcClient private constructor(
         timeoutMs: Long,
     ): io.github.nicolals.nwc.NwcResult<Map<String, NwcResponse>> {
         // Ensure we are connected before proceeding
-        val connectionTimeout = minOf(10_000L, timeoutMs)
+        // Give generous time for connection establishment with retries
+        val connectionTimeout = when {
+            timeoutMs <= 10_000L -> timeoutMs / 2
+            timeoutMs <= 30_000L -> minOf(15_000L, timeoutMs / 2)
+            else -> 15_000L
+        }
         if (!ensureConnected(connectionTimeout)) {
             val state = _state.value
             val message = if (state is NwcClientState.Failed) {
@@ -1258,6 +1316,43 @@ class NwcClient private constructor(
     companion object {
         /** Timeout for waiting for relay to acknowledge publish (OK message) */
         private const val PUBLISH_ACK_TIMEOUT_MS = 5_000L
+
+        /** Default timeout for WebSocket connection establishment (DNS + TCP + TLS + WS handshake) */
+        private const val DEFAULT_CONNECTION_TIMEOUT_MS = 10_000L
+
+        /**
+         * Timeout per connection attempt (shorter to allow retries).
+         * 7s is generous for mobile networks where DNS and TLS can be slow.
+         */
+        private const val CONNECTION_ATTEMPT_TIMEOUT_MS = 7_000L
+
+        /** Timeout for fetching wallet info after connection */
+        private const val WALLET_INFO_TIMEOUT_MS = 5_000L
+
+        /**
+         * Maximum number of connection attempts before giving up.
+         * 3 attempts with exponential backoff provides good balance between
+         * resilience and responsiveness for payment apps.
+         *
+         * Timing with 15s budget:
+         * - Attempt 1: immediate (up to 7s)
+         * - Attempt 2: after 500ms backoff (up to 7s)
+         * - Attempt 3: after 1000ms backoff (up to remaining time)
+         */
+        private const val MAX_CONNECTION_ATTEMPTS = 3
+
+        /** Base delay for exponential backoff between connection attempts */
+        private const val CONNECTION_BACKOFF_BASE_MS = 500L
+
+        /** Maximum backoff delay between connection attempts */
+        private const val CONNECTION_BACKOFF_MAX_MS = 3_000L
+
+        /**
+         * Minimum time budget required to attempt another connection retry.
+         * Should be slightly less than CONNECTION_ATTEMPT_TIMEOUT_MS to allow
+         * a meaningful attempt.
+         */
+        private const val MIN_RETRY_BUDGET_MS = 4_000L
 
         /** Interval for WebSocket ping to detect dead connections (10 seconds) */
         private const val PING_INTERVAL_MS = 10_000L
