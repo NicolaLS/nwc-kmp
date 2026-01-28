@@ -4,10 +4,10 @@ val groupId = "io.github.nicolals"
 val versionName = "0.2.1-SNAPSHOT"
 
 plugins {
-    id("com.android.library") version "8.13.0" apply false
-    id("com.android.kotlin.multiplatform.library") version "8.13.0" apply false
-    id("org.jetbrains.kotlin.multiplatform") version "2.3.0" apply false
-    id("com.vanniktech.maven.publish") version "0.34.0" apply false
+    alias(libs.plugins.androidLibrary) apply false
+    alias(libs.plugins.androidKotlinMultiplatformLibrary) apply false
+    alias(libs.plugins.kotlinMultiplatform) apply false
+    alias(libs.plugins.vanniktech.mavenPublish) apply false
 }
 
 allprojects {

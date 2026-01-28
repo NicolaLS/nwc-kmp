@@ -4,10 +4,6 @@ pluginManagement {
         mavenCentral()
         gradlePluginPortal()
     }
-    plugins {
-        id("com.android.library") version "8.13.0"
-        id("com.android.kotlin.multiplatform.library") version "8.13.0"
-    }
 }
 
 dependencyResolutionManagement {
