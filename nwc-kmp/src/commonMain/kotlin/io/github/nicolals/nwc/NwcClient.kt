@@ -825,13 +825,18 @@ class NwcClient private constructor(
             }
         }
 
-        // Find pending request by event ID
+        // Find pending request by event ID. Some NWC wallets omit the NIP-47
+        // response "e" tag, so safely fall back only when there is exactly one
+        // single-request operation waiting for a response.
         val requestId = responseEvent.requestEventId?.hex
         val responseId = responseEvent.responseId
 
         if (requestId != null) {
             // Single request response
             pendingRequests.remove(requestId)?.complete(response)
+        } else if (responseId == null && pendingRequests.size == 1) {
+            val onlyRequestId = pendingRequests.keys.single()
+            pendingRequests.remove(onlyRequestId)?.complete(response)
         }
 
         if (responseId != null) {
@@ -1034,43 +1039,47 @@ class NwcClient private constructor(
             }
 
             is PublishStatus.Abandoned, is PublishStatus.Replaced -> {
-                // Connection failed or publish was replaced
-                pendingRequests.remove(requestId)
-                return if (sawPending) {
-                    // We sent bytes but never got ack - UNKNOWN state
-                    // Treat as timeout so app knows to verify
-                    io.github.nicolals.nwc.NwcResult.failure(
-                        io.github.nicolals.nwc.NwcError.Timeout(
-                            message = "Connection lost after sending request",
-                            durationMs = PUBLISH_ACK_TIMEOUT_MS
+                if (!deferred.isCompleted) {
+                    // Connection failed or publish was replaced
+                    pendingRequests.remove(requestId)
+                    return if (sawPending) {
+                        // We sent bytes but never got ack - UNKNOWN state
+                        // Treat as timeout so app knows to verify
+                        io.github.nicolals.nwc.NwcResult.failure(
+                            io.github.nicolals.nwc.NwcError.Timeout(
+                                message = "Connection lost after sending request",
+                                durationMs = PUBLISH_ACK_TIMEOUT_MS
+                            )
                         )
-                    )
-                } else {
-                    // Never sent - safe to retry
-                    io.github.nicolals.nwc.NwcResult.failure(
-                        io.github.nicolals.nwc.NwcError.ConnectionError("Request not sent: connection failed")
-                    )
+                    } else {
+                        // Never sent - safe to retry
+                        io.github.nicolals.nwc.NwcResult.failure(
+                            io.github.nicolals.nwc.NwcError.ConnectionError("Request not sent: connection failed")
+                        )
+                    }
                 }
             }
 
             null -> {
-                // Timeout waiting for publish ack
-                // Check current status to determine what happened
-                val currentStatus = publishHandle.status
-                pendingRequests.remove(requestId)
-                return if (currentStatus == PublishStatus.Pending || sawPending) {
-                    // Bytes were sent but no relay ack yet - UNKNOWN state
-                    io.github.nicolals.nwc.NwcResult.failure(
-                        io.github.nicolals.nwc.NwcError.Timeout(
-                            message = "Timeout waiting for relay acknowledgment",
-                            durationMs = PUBLISH_ACK_TIMEOUT_MS
+                if (!deferred.isCompleted) {
+                    // Timeout waiting for publish ack
+                    // Check current status to determine what happened
+                    val currentStatus = publishHandle.status
+                    pendingRequests.remove(requestId)
+                    return if (currentStatus == PublishStatus.Pending || sawPending) {
+                        // Bytes were sent but no relay ack yet - UNKNOWN state
+                        io.github.nicolals.nwc.NwcResult.failure(
+                            io.github.nicolals.nwc.NwcError.Timeout(
+                                message = "Timeout waiting for relay acknowledgment",
+                                durationMs = PUBLISH_ACK_TIMEOUT_MS
+                            )
                         )
-                    )
-                } else {
-                    // Still queued - request never sent
-                    io.github.nicolals.nwc.NwcResult.failure(
-                        io.github.nicolals.nwc.NwcError.ConnectionError("Request not sent: publish timeout")
-                    )
+                    } else {
+                        // Still queued - request never sent
+                        io.github.nicolals.nwc.NwcResult.failure(
+                            io.github.nicolals.nwc.NwcError.ConnectionError("Request not sent: publish timeout")
+                        )
+                    }
                 }
             }
 
