@@ -1,7 +1,8 @@
 import com.vanniktech.maven.publish.MavenPublishBaseExtension
+import org.gradle.api.publish.maven.tasks.PublishToMavenRepository
 
 val groupId = "io.github.nicolals"
-val versionName = "0.2.1-SNAPSHOT"
+val versionName = "0.3.0-SNAPSHOT"
 
 plugins {
     alias(libs.plugins.androidLibrary) apply false
@@ -49,7 +50,11 @@ subprojects {
                 }
             }
 
-            if (rootProject.hasProperty("signing.keyId")) {
+            if (
+                rootProject.hasProperty("signing.keyId") ||
+                rootProject.hasProperty("signingInMemoryKey") ||
+                rootProject.hasProperty("signingInMemoryKeyId")
+            ) {
                 signAllPublications()
             }
         }
@@ -60,5 +65,30 @@ if (tasks.findByName("prepareKotlinBuildScriptModel") == null) {
     tasks.register("prepareKotlinBuildScriptModel") {
         group = "help"
         description = "No-op to satisfy older IDEs that request this removed Gradle task."
+    }
+}
+
+gradle.projectsEvaluated {
+    // Keep compile/package work parallel and allow each module to upload its own
+    // publications together, but serialize uploads between modules to reduce
+    // Central Portal rate-limit pressure.
+    val mavenCentralUploadTasksByProject = allprojects
+        .map { project ->
+            project to project.tasks.withType(PublishToMavenRepository::class.java)
+                .matching { it.repository.name == "mavenCentral" }
+                .toList()
+        }
+        .filter { (_, tasks) -> tasks.isNotEmpty() }
+        .sortedBy { (project, _) -> project.path }
+
+    mavenCentralUploadTasksByProject.zipWithNext().forEach { taskGroups ->
+        val previousTasks = taskGroups.first.second
+        val nextTasks = taskGroups.second.second
+
+        nextTasks.forEach { next ->
+            previousTasks.forEach { previous ->
+                next.mustRunAfter(previous)
+            }
+        }
     }
 }
