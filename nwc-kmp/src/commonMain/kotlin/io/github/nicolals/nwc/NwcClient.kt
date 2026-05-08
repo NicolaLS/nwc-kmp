@@ -362,15 +362,20 @@ class NwcClient private constructor(
         // Fail all pending requests with connection error.
         // NWC events are ephemeral - they won't be replayed after reconnection,
         // so we fail immediately. The app should use lookup_invoice to verify.
+        //
+        // Snapshot and clear the maps before completing the deferreds:
+        // completeExceptionally can synchronously resume an awaiter in sendRequest
+        // whose catch block calls pendingRequests.remove(), which would otherwise
+        // mutate the map mid-iteration and throw ConcurrentModificationException.
         val error = io.github.nicolals.nwc.NwcError.ConnectionError("Connection lost")
-        pendingRequests.values.forEach {
-            it.completeExceptionally(NwcException(error))
-        }
+
+        val pendingSnapshot = pendingRequests.values.toList()
         pendingRequests.clear()
-        pendingMultiRequests.values.forEach { items ->
-            items.values.forEach { it.completeExceptionally(NwcException(error)) }
-        }
+        pendingSnapshot.forEach { it.completeExceptionally(NwcException(error)) }
+
+        val pendingMultiSnapshot = pendingMultiRequests.values.flatMap { it.values.toList() }
         pendingMultiRequests.clear()
+        pendingMultiSnapshot.forEach { it.completeExceptionally(NwcException(error)) }
     }
 
     /**
