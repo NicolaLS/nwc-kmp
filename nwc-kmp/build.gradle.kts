@@ -1,10 +1,9 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
-import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
-    alias(libs.plugins.androidLibrary)
+    alias(libs.plugins.androidKotlinMultiplatformLibrary)
     alias(libs.plugins.vanniktech.mavenPublish)
 }
 
@@ -14,8 +13,20 @@ kotlin {
 
     applyDefaultHierarchyTemplate()
 
-    androidTarget()
-    jvm()
+    android {
+        namespace = "io.github.nicolals.nwc"
+        compileSdk = libs.versions.android.compileSdk.get().toInt()
+        minSdk = libs.versions.android.minSdk.get().toInt()
+
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_11)
+        }
+    }
+    jvm {
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_11)
+        }
+    }
     iosX64()
     iosArm64()
     iosSimulatorArm64()
@@ -41,7 +52,7 @@ kotlin {
                 implementation(libs.nip04)
                 // NIP-47 types (NwcEncryption) are exposed in public API
                 api(libs.nip47)
-                implementation(libs.ktor.client.core.v331)
+                implementation(libs.ktor.client.core)
             }
         }
 
@@ -69,23 +80,5 @@ kotlin {
                 implementation(libs.ktor.client.darwin)
             }
         }
-    }
-}
-
-tasks.withType<KotlinJvmCompile>().configureEach {
-    compilerOptions {
-        jvmTarget.set(JvmTarget.JVM_11)
-    }
-}
-
-android {
-    namespace = "io.github.nicolals.nwc"
-    compileSdk = libs.versions.android.compileSdk.get().toInt()
-    defaultConfig {
-        minSdk = libs.versions.android.minSdk.get().toInt()
-    }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
     }
 }

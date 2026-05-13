@@ -2,10 +2,9 @@ import com.vanniktech.maven.publish.MavenPublishBaseExtension
 import org.gradle.api.publish.maven.tasks.PublishToMavenRepository
 
 val groupId = "io.github.nicolals"
-val versionName = "0.3.1-SNAPSHOT"
+val versionName = "0.3.2-SNAPSHOT"
 
 plugins {
-    alias(libs.plugins.androidLibrary) apply false
     alias(libs.plugins.androidKotlinMultiplatformLibrary) apply false
     alias(libs.plugins.kotlinMultiplatform) apply false
     alias(libs.plugins.vanniktech.mavenPublish) apply false
