@@ -34,7 +34,7 @@ jobs:
         run: grep -q 'val versionName = ".*-SNAPSHOT"' build.gradle.kts
 
       - name: Publish snapshot to Maven Central
-        run: ./gradlew publishToMavenCentral --parallel --no-configuration-cache
+        run: ./gradlew publishToMavenCentral --parallel --no-configuration-cache --refresh-dependencies
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}

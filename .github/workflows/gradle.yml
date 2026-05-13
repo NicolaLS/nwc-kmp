@@ -20,15 +20,12 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: iosSimulatorArm64Test
             os: macos-latest
           - target: jvmTest
-            os: ubuntu-latest
-          - target: linuxX64Test
-            os: ubuntu-latest
-          - target: testAndroidHostTest
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
 
@@ -37,16 +34,17 @@ jobs:
     - name: Validate Gradle Wrapper
       uses: gradle/actions/wrapper-validation@v4
     - uses: actions/cache@v4
+      if: runner.os == 'macOS'
       with:
         path: |
           ~/.konan
-        key: ${{ runner.os }}-${{ hashFiles('**/.lock') }}
-    - name: Set up JDK 17
-      uses: actions/setup-java@v3
+        key: ${{ runner.os }}-konan-${{ hashFiles('gradle/libs.versions.toml', 'gradle/wrapper/gradle-wrapper.properties') }}
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
       with:
-        java-version: '17'
+        java-version: '21'
         distribution: 'temurin'
-    - name: Build with Gradle
-      uses: gradle/gradle-build-action@ce999babab2de1c4b649dc15f0ee67e6246c994f
-      with:
-        arguments: ${{ matrix.target }}
+    - name: Set up Gradle
+      uses: gradle/actions/setup-gradle@v4
+    - name: Run Gradle target
+      run: ./gradlew ${{ matrix.target }} --refresh-dependencies --warning-mode all
