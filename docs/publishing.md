@@ -30,7 +30,7 @@ https://central.sonatype.com/repository/maven-snapshots/
 Keep `versionName` in `build.gradle.kts` as a `-SNAPSHOT` version, for example:
 
 ```kotlin
-val versionName = "0.3.1-SNAPSHOT"
+val versionName = "0.3.3-SNAPSHOT"
 ```
 
 Then run the manual GitHub workflow:
@@ -44,7 +44,7 @@ Then run the manual GitHub workflow:
 Verify a snapshot upload with:
 
 ```sh
-curl -fsSL https://central.sonatype.com/repository/maven-snapshots/io/github/nicolals/nwc-kmp/0.3.1-SNAPSHOT/maven-metadata.xml
+curl -fsSL https://central.sonatype.com/repository/maven-snapshots/io/github/nicolals/nwc-kmp/0.3.3-SNAPSHOT/maven-metadata.xml
 ```
 
 Consumers need the snapshot repository explicitly:
@@ -72,4 +72,3 @@ Before publishing, run:
 ./gradlew build
 ./gradlew publishToMavenLocal
 ```
-

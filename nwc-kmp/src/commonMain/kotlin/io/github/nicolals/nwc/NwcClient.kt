@@ -50,8 +50,8 @@ import io.github.nicolals.nostr.nip47.model.NwcResponse
 import io.github.nicolals.nostr.nip47.model.NwcResult
 import io.github.nicolals.nostr.nip47.model.NwcTlvRecord
 import io.github.nicolals.nostr.nip47.model.NwcTransaction
-import io.github.nicolals.nostr.runtime.coroutines.CoroutinesRelaySession
-import io.github.nicolals.nostr.runtime.coroutines.CoroutinesSubscriptionHandle
+import io.github.nicolals.nostr.runtime.coroutines.CoroutinesPoolSubscriptionHandle
+import io.github.nicolals.nostr.runtime.coroutines.CoroutinesRelayPool
 import io.github.nicolals.nostr.transport.ktor.KtorRelayTransportFactory
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.CancellationException
@@ -70,6 +70,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.time.TimeSource
 
@@ -163,17 +165,19 @@ class NwcClient private constructor(
         Nip47Module(ctx, encryptionSelector),
     )
 
-    // Session for the first relay (we'll only use one for simplicity)
-    private var session: CoroutinesRelaySession? = null
-    private var subscriptionHandle: CoroutinesSubscriptionHandle? = null
-    private var notificationHandle: CoroutinesSubscriptionHandle? = null
+    private val hasCachedWalletInfo = cachedWalletInfo != null
+    private var relayPool: CoroutinesRelayPool? = null
+    private var subscriptionHandle: CoroutinesPoolSubscriptionHandle? = null
+    private var notificationHandle: CoroutinesPoolSubscriptionHandle? = null
     private var eventCollectorJob: Job? = null
     private var notificationCollectorJob: Job? = null
     private var sessionLifecycleJob: Job? = null
 
     // Pending requests awaiting responses
-    private val pendingRequests = mutableMapOf<String, CompletableDeferred<NwcResponse>>()
+    private val pendingMutex = Mutex()
+    private val pendingRequests = mutableMapOf<String, PendingRequest>()
     private val pendingMultiRequests = mutableMapOf<String, MutableMap<String, CompletableDeferred<NwcResponse>>>()
+    private val _pendingRequestCount = MutableStateFlow(0)
 
     // ========== Public State ==========
 
@@ -218,7 +222,7 @@ class NwcClient private constructor(
      *
      * Useful for UI to show activity indicator or for debugging.
      */
-    val pendingRequestCount: Int get() = pendingRequests.size
+    val pendingRequestCount: Int get() = _pendingRequestCount.value
 
     // ========== Connection Management ==========
 
@@ -244,62 +248,59 @@ class NwcClient private constructor(
         }
 
         _state.value = NwcClientState.Connecting
-
-        // Cancel any previous lifecycle observation
         sessionLifecycleJob?.cancel()
         sessionLifecycleJob = null
-
-        val relayUrl = RelayUrl.parse(connectionUri.relays.first())
-        // Configure session with fail-fast behavior and periodic pinging.
-        // NWC events are ephemeral (not replayed by relay), so we don't use
-        // auto-reconnection - it won't help recover in-flight requests.
         val sessionConfig = SessionConfig.Minimal.copy(
             pingIntervalMillis = PING_INTERVAL_MS,
         )
-
-        val newSession = CoroutinesRelaySession(
-            url = relayUrl,
+        val newPool = CoroutinesRelayPool(
             moduleContext = ctx,
             transportFactory = transportFactory,
             scope = scope,
-            // Use Minimal config for fail-fast behavior:
-            // - No automatic reconnection (app controls retry)
-            // - No publish retry (fail immediately on disconnect)
-            // - Periodic ping to detect dead connections faster
-            config = sessionConfig,
+            sessionConfig = sessionConfig,
             additionalModules = additionalModules,
         )
+        val previousPool = relayPool
+        relayPool = newPool
 
-        session = newSession
-        newSession.connect()
-
-        // Launch initialization coroutine
         scope.launch {
             try {
-                // Wait for connection with configurable timeout
-                val connected = newSession.awaitConnected(timeoutMs = connectionTimeoutMs)
+                previousPool?.close()
+                connectionUri.relays
+                    .map(RelayUrl::parse)
+                    .distinct()
+                    .forEach { relayUrl -> newPool.addRelay(relayUrl) }
+                newPool.connectAll()
+                val connected = withTimeoutOrNull(connectionTimeoutMs) {
+                    newPool.connectionStatusFlow.first { statuses ->
+                        statuses.values.any { it == ConnectionStatus.Connected }
+                    }
+                } != null
                 if (!connected) {
                     _state.value = NwcClientState.Failed(
-                        io.github.nicolals.nwc.NwcError.ConnectionError("Failed to connect to relay")
+                        io.github.nicolals.nwc.NwcError.ConnectionError("Failed to connect to any relay")
                     )
                     return@launch
                 }
 
-                // Fetch wallet info event
-                fetchWalletInfo(newSession)
-
-                // Subscribe to responses
-                subscribeToResponses(newSession)
-
-                // Subscribe to notifications if supported
+                subscribeToResponses(newPool)
                 if (_walletInfo.value.supportsNotifications) {
-                    subscribeToNotifications(newSession)
+                    subscribeToNotifications(newPool)
                 }
-
-                _state.value = NwcClientState.Ready
-
-                // Start observing session lifecycle for disconnection
-                observeSessionLifecycle(newSession)
+                if (hasCachedWalletInfo) {
+                    _state.value = NwcClientState.Ready
+                    observeSessionLifecycle(newPool)
+                    scope.launch {
+                        runCatching { fetchWalletInfo(newPool) }
+                        if (_walletInfo.value.supportsNotifications && notificationHandle == null) {
+                            subscribeToNotifications(newPool)
+                        }
+                    }
+                } else {
+                    fetchWalletInfo(newPool)
+                    _state.value = NwcClientState.Ready
+                    observeSessionLifecycle(newPool)
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -319,19 +320,15 @@ class NwcClient private constructor(
      * so we fail pending requests immediately on disconnect rather than
      * waiting for reconnection.
      */
-    private fun observeSessionLifecycle(observedSession: CoroutinesRelaySession) {
+    private fun observeSessionLifecycle(observedPool: CoroutinesRelayPool) {
         sessionLifecycleJob = scope.launch {
-            observedSession.connectionStatusFlow.collect { status ->
-                // Only handle disconnection if this is still our active session
-                // and we're currently in Ready state
-                if (session !== observedSession) return@collect
+            observedPool.connectionStatusFlow.collect { statuses ->
+                if (relayPool !== observedPool) return@collect
                 if (_state.value != NwcClientState.Ready) return@collect
-
-                when (status) {
-                    is ConnectionStatus.Failed, ConnectionStatus.Disconnected -> {
-                        handleSessionDisconnected()
-                    }
-                    else -> { /* Connected, Connecting, Reconnecting - ignore */ }
+                if (statuses.isNotEmpty() &&
+                    statuses.values.none { it == ConnectionStatus.Connected }
+                ) {
+                    handleSessionDisconnected()
                 }
             }
         }
@@ -347,7 +344,6 @@ class NwcClient private constructor(
         // Transition to Disconnected (allows reconnection via connect())
         _state.value = NwcClientState.Disconnected
 
-        // Clean up the dead session
         eventCollectorJob?.cancel()
         eventCollectorJob = null
         notificationCollectorJob?.cancel()
@@ -356,26 +352,25 @@ class NwcClient private constructor(
         subscriptionHandle = null
         notificationHandle?.close()
         notificationHandle = null
-        session?.close()
-        session = null
-
-        // Fail all pending requests with connection error.
-        // NWC events are ephemeral - they won't be replayed after reconnection,
-        // so we fail immediately. The app should use lookup_invoice to verify.
-        //
-        // Snapshot and clear the maps before completing the deferreds:
-        // completeExceptionally can synchronously resume an awaiter in sendRequest
-        // whose catch block calls pendingRequests.remove(), which would otherwise
-        // mutate the map mid-iteration and throw ConcurrentModificationException.
-        val error = io.github.nicolals.nwc.NwcError.ConnectionError("Connection lost")
-
-        val pendingSnapshot = pendingRequests.values.toList()
-        pendingRequests.clear()
-        pendingSnapshot.forEach { it.completeExceptionally(NwcException(error)) }
-
-        val pendingMultiSnapshot = pendingMultiRequests.values.flatMap { it.values.toList() }
-        pendingMultiRequests.clear()
-        pendingMultiSnapshot.forEach { it.completeExceptionally(NwcException(error)) }
+        val previousPool = relayPool
+        relayPool = null
+        scope.launch {
+            previousPool?.close()
+            val error = io.github.nicolals.nwc.NwcError.ConnectionError("Connection lost")
+            val pendingSnapshot = pendingMutex.withLock {
+                val requests = pendingRequests.values.map(PendingRequest::deferred)
+                pendingRequests.clear()
+                _pendingRequestCount.value = 0
+                requests
+            }
+            pendingSnapshot.forEach { it.completeExceptionally(NwcException(error)) }
+            val pendingMultiSnapshot = pendingMutex.withLock {
+                val requests = pendingMultiRequests.values.flatMap { it.values.toList() }
+                pendingMultiRequests.clear()
+                requests
+            }
+            pendingMultiSnapshot.forEach { it.completeExceptionally(NwcException(error)) }
+        }
     }
 
     /**
@@ -393,7 +388,7 @@ class NwcClient private constructor(
     /**
      * Closes the client and releases all resources.
      */
-    fun close() {
+    suspend fun close() {
         _state.value = NwcClientState.Closed
         sessionLifecycleJob?.cancel()
         sessionLifecycleJob = null
@@ -405,19 +400,23 @@ class NwcClient private constructor(
         subscriptionHandle = null
         notificationHandle?.close()
         notificationHandle = null
-        session?.close()
-        session = null
-
-        // Fail all pending requests
+        val previousPool = relayPool
+        relayPool = null
+        previousPool?.close()
         val error = io.github.nicolals.nwc.NwcError.Cancelled()
-        pendingRequests.values.forEach {
-            it.completeExceptionally(NwcException(error))
+        val pendingSnapshot = pendingMutex.withLock {
+            val requests = pendingRequests.values.map(PendingRequest::deferred)
+            pendingRequests.clear()
+            _pendingRequestCount.value = 0
+            requests
         }
-        pendingRequests.clear()
-        pendingMultiRequests.values.forEach { items ->
-            items.values.forEach { it.completeExceptionally(NwcException(error)) }
+        pendingSnapshot.forEach { it.completeExceptionally(NwcException(error)) }
+        val pendingMultiSnapshot = pendingMutex.withLock {
+            val requests = pendingMultiRequests.values.flatMap { it.values.toList() }
+            pendingMultiRequests.clear()
+            requests
         }
-        pendingMultiRequests.clear()
+        pendingMultiSnapshot.forEach { it.completeExceptionally(NwcException(error)) }
     }
 
     // ========== Wallet Operations ==========
@@ -736,11 +735,11 @@ class NwcClient private constructor(
      * Refreshes the wallet info event from the relay.
      */
     suspend fun refreshWalletInfo(): io.github.nicolals.nwc.NwcResult<WalletInfo> {
-        val currentSession = session ?: return io.github.nicolals.nwc.NwcResult.failure(
+        val currentPool = relayPool ?: return io.github.nicolals.nwc.NwcResult.failure(
             io.github.nicolals.nwc.NwcError.ConnectionError("Not connected")
         )
         return try {
-            fetchWalletInfo(currentSession)
+            fetchWalletInfo(currentPool)
             io.github.nicolals.nwc.NwcResult.success(_walletInfo.value)
         } catch (e: Exception) {
             io.github.nicolals.nwc.NwcResult.failure(
@@ -751,14 +750,14 @@ class NwcClient private constructor(
 
     // ========== Internal Methods ==========
 
-    private suspend fun fetchWalletInfo(session: CoroutinesRelaySession) {
+    private suspend fun fetchWalletInfo(pool: CoroutinesRelayPool) {
         val filter = Filter(
             kinds = listOf(NwcInfoEvent.KIND),
             authors = listOf(connectionUri.walletPubkey),
             limit = 1,
         )
 
-        val handle = session.subscribe(listOf(filter))
+        val handle = pool.subscribe(listOf(filter))
         try {
             val event = withTimeoutOrNull(5_000L) {
                 var result: Event? = null
@@ -780,14 +779,14 @@ class NwcClient private constructor(
         }
     }
 
-    private fun subscribeToResponses(session: CoroutinesRelaySession) {
+    private suspend fun subscribeToResponses(pool: CoroutinesRelayPool) {
         val filter = Filter(
             kinds = listOf(NwcResponseEvent.KIND),
             authors = listOf(connectionUri.walletPubkey),
             tagFilters = mapOf("p" to listOf(connectionUri.clientPubkey.hex)),
         )
 
-        val handle = session.subscribe(listOf(filter))
+        val handle = pool.subscribe(listOf(filter))
         subscriptionHandle = handle
 
         eventCollectorJob = scope.launch {
@@ -797,7 +796,7 @@ class NwcClient private constructor(
         }
     }
 
-    private fun subscribeToNotifications(session: CoroutinesRelaySession) {
+    private suspend fun subscribeToNotifications(pool: CoroutinesRelayPool) {
         val nip44Kind = NwcNotificationEvent.KIND
         val nip04Kind = NwcNotificationEvent.LEGACY_KIND
 
@@ -807,7 +806,7 @@ class NwcClient private constructor(
             tagFilters = mapOf("p" to listOf(connectionUri.clientPubkey.hex)),
         )
 
-        val handle = session.subscribe(listOf(filter))
+        val handle = pool.subscribe(listOf(filter))
         notificationHandle = handle
 
         notificationCollectorJob = scope.launch {
@@ -830,24 +829,35 @@ class NwcClient private constructor(
             }
         }
 
-        // Find pending request by event ID. Some NWC wallets omit the NIP-47
-        // response "e" tag, so safely fall back only when there is exactly one
-        // single-request operation waiting for a response.
-        val requestId = responseEvent.requestEventId?.hex
+        val requestId = responseEvent.requestEventId?.hex ?: return
         val responseId = responseEvent.responseId
 
-        if (requestId != null) {
-            // Single request response
-            pendingRequests.remove(requestId)?.complete(response)
-        } else if (responseId == null && pendingRequests.size == 1) {
-            val onlyRequestId = pendingRequests.keys.single()
-            pendingRequests.remove(onlyRequestId)?.complete(response)
-        }
-
-        if (responseId != null) {
-            // Multi-request response - find by response ID (d tag)
-            val multiItems = pendingMultiRequests.values.firstOrNull { it.containsKey(responseId) }
-            multiItems?.remove(responseId)?.complete(response)
+        scope.launch {
+            if (responseId == null) {
+                val pending = pendingMutex.withLock {
+                    val candidate = pendingRequests[requestId]
+                    if (
+                        !isExactResponseMatch(
+                            responseRequestId = requestId,
+                            pendingRequestId = requestId.takeIf { candidate != null },
+                            expectedMethod = candidate?.expectedMethod,
+                            resultType = response.resultType
+                        )
+                    ) {
+                        null
+                    } else {
+                        pendingRequests.remove(requestId).also {
+                            _pendingRequestCount.value = pendingRequests.size
+                        }
+                    }
+                }
+                pending?.deferred?.complete(response)
+            } else {
+                val deferred = pendingMutex.withLock {
+                    pendingMultiRequests[requestId]?.remove(responseId)
+                }
+                deferred?.complete(response)
+            }
         }
     }
 
@@ -960,7 +970,7 @@ class NwcClient private constructor(
             )
         }
         
-        val currentSession = session ?: return io.github.nicolals.nwc.NwcResult.failure(
+        val currentPool = relayPool ?: return io.github.nicolals.nwc.NwcResult.failure(
             io.github.nicolals.nwc.NwcError.ConnectionError("Not connected")
         )
 
@@ -970,10 +980,10 @@ class NwcClient private constructor(
             )
         }
 
-        // Check session connection status - fail fast if already disconnected
-        if (currentSession.connectionStatus != ConnectionStatus.Connected) {
-            // Session is not connected (reconnecting, failed, etc.)
-            // State will be updated by the lifecycle observer
+        if (currentPool.connectionStatusFlow.value.values.none {
+                it == ConnectionStatus.Connected
+            }
+        ) {
             return io.github.nicolals.nwc.NwcResult.failure(
                 io.github.nicolals.nwc.NwcError.ConnectionError("Connection lost")
             )
@@ -988,6 +998,9 @@ class NwcClient private constructor(
             ctx = ctx,
             clientPrivateKey = connectionUri.secret,
             encryption = encryption,
+            expiration = UnixTimeSeconds(
+                requestExpirationSeconds(UnixTimeSeconds.now().value, timeoutMs)
+            ),
         )
 
         val template = when (templateResult) {
@@ -1000,97 +1013,62 @@ class NwcClient private constructor(
         val signedEvent = signer.sign(template)
         val requestId = signedEvent.event.id.hex
 
-        // Register pending request before publishing
         val deferred = CompletableDeferred<NwcResponse>()
-        pendingRequests[requestId] = deferred
+        pendingMutex.withLock {
+            pendingRequests[requestId] = PendingRequest(request.method, deferred)
+            _pendingRequestCount.value = pendingRequests.size
+        }
 
-        // Publish the event and track status
-        val publishHandle = currentSession.publish(signedEvent.event)
+        val publishHandle = currentPool.publish(signedEvent.event)
 
         // Track if we ever saw Pending status (meaning bytes were sent to relay)
         // Check immediately - status might already be Pending or past it before we subscribe
         // Pending = bytes being sent, Accepted = relay confirmed receipt
         // Either means bytes went out (or at least an attempt was made)
-        val initialStatus = publishHandle.status
-        var sawPending = initialStatus == PublishStatus.Pending ||
-            initialStatus is PublishStatus.Accepted
+        val initialStatuses = publishHandle.status.values
+        var sawPending = initialStatuses.any {
+            it == PublishStatus.Pending || it is PublishStatus.Accepted
+        }
 
         // Wait for publish to be acknowledged by relay (with short timeout)
         // This tells us if the request made it to the relay
-        val publishStatus = withTimeoutOrNull(PUBLISH_ACK_TIMEOUT_MS) {
-            publishHandle.statusFlow.first { status ->
-                if (status == PublishStatus.Pending) {
+        val publishStatuses = withTimeoutOrNull(PUBLISH_ACK_TIMEOUT_MS) {
+            publishHandle.statusFlow.first { statuses ->
+                if (statuses.values.any { it == PublishStatus.Pending }) {
                     sawPending = true
                 }
-                status.isTerminal
+                statuses.values.any { it is PublishStatus.Accepted } ||
+                    statuses.values.all { it.isTerminal }
             }
         }
+        publishHandle.close()
 
-        // Check publish result
-        when (publishStatus) {
-            is PublishStatus.Accepted -> {
-                // Request is on the relay - wallet will receive it
-                // Now wait for the wallet's response
-            }
-
-            is PublishStatus.Rejected -> {
-                // Relay rejected our event - request NOT sent
-                pendingRequests.remove(requestId)
-                return io.github.nicolals.nwc.NwcResult.failure(
-                    io.github.nicolals.nwc.NwcError.ConnectionError(
-                        "Relay rejected request: ${publishStatus.message}"
+        val accepted = publishStatuses?.values?.any { it is PublishStatus.Accepted } == true
+        if (!accepted && !deferred.isCompleted) {
+            removePendingRequest(requestId)
+            val rejectedMessage = publishStatuses
+                ?.values
+                ?.filterIsInstance<PublishStatus.Rejected>()
+                ?.firstOrNull()
+                ?.message
+            return if (sawPending ||
+                publishHandle.status.values.any {
+                    it == PublishStatus.Pending || it is PublishStatus.Accepted
+                }
+            ) {
+                io.github.nicolals.nwc.NwcResult.failure(
+                    io.github.nicolals.nwc.NwcError.Timeout(
+                        message = "Request may have been published without acknowledgment",
+                        durationMs = PUBLISH_ACK_TIMEOUT_MS
                     )
                 )
-            }
-
-            is PublishStatus.Abandoned, is PublishStatus.Replaced -> {
-                if (!deferred.isCompleted) {
-                    // Connection failed or publish was replaced
-                    pendingRequests.remove(requestId)
-                    return if (sawPending) {
-                        // We sent bytes but never got ack - UNKNOWN state
-                        // Treat as timeout so app knows to verify
-                        io.github.nicolals.nwc.NwcResult.failure(
-                            io.github.nicolals.nwc.NwcError.Timeout(
-                                message = "Connection lost after sending request",
-                                durationMs = PUBLISH_ACK_TIMEOUT_MS
-                            )
-                        )
-                    } else {
-                        // Never sent - safe to retry
-                        io.github.nicolals.nwc.NwcResult.failure(
-                            io.github.nicolals.nwc.NwcError.ConnectionError("Request not sent: connection failed")
-                        )
-                    }
-                }
-            }
-
-            null -> {
-                if (!deferred.isCompleted) {
-                    // Timeout waiting for publish ack
-                    // Check current status to determine what happened
-                    val currentStatus = publishHandle.status
-                    pendingRequests.remove(requestId)
-                    return if (currentStatus == PublishStatus.Pending || sawPending) {
-                        // Bytes were sent but no relay ack yet - UNKNOWN state
-                        io.github.nicolals.nwc.NwcResult.failure(
-                            io.github.nicolals.nwc.NwcError.Timeout(
-                                message = "Timeout waiting for relay acknowledgment",
-                                durationMs = PUBLISH_ACK_TIMEOUT_MS
-                            )
-                        )
-                    } else {
-                        // Still queued - request never sent
-                        io.github.nicolals.nwc.NwcResult.failure(
-                            io.github.nicolals.nwc.NwcError.ConnectionError("Request not sent: publish timeout")
-                        )
-                    }
-                }
-            }
-
-            else -> {
-                // Non-terminal status (shouldn't happen due to first{} filter)
-                // Continue to wait for response
+            } else {
+                io.github.nicolals.nwc.NwcResult.failure(
+                    io.github.nicolals.nwc.NwcError.ConnectionError(
+                        rejectedMessage?.let { "Relay rejected request: $it" }
+                            ?: "Request not sent: no relay accepted publication"
+                    )
+                )
             }
         }
 
@@ -1101,7 +1079,7 @@ class NwcClient private constructor(
             }
 
             if (response == null) {
-                pendingRequests.remove(requestId)
+                removePendingRequest(requestId)
                 // Request was sent (Accepted) but no response - timeout
                 io.github.nicolals.nwc.NwcResult.failure(
                     io.github.nicolals.nwc.NwcError.Timeout(
@@ -1110,7 +1088,7 @@ class NwcClient private constructor(
                     )
                 )
             } else {
-                pendingRequests.remove(requestId)
+                removePendingRequest(requestId)
                 val responseError = response.error
                 if (responseError != null) {
                     io.github.nicolals.nwc.NwcResult.failure(responseError.toNwcError())
@@ -1119,7 +1097,7 @@ class NwcClient private constructor(
                 }
             }
         } catch (e: CancellationException) {
-            pendingRequests.remove(requestId)
+            removePendingRequest(requestId)
             throw e
         } catch (e: NwcException) {
             // Connection lost while waiting for response.
@@ -1128,7 +1106,7 @@ class NwcClient private constructor(
             // before retrying - the payment might have succeeded.
             // NWC events are ephemeral and won't be replayed, so we can't
             // recover the response via subscription.
-            pendingRequests.remove(requestId)
+            removePendingRequest(requestId)
             io.github.nicolals.nwc.NwcResult.failure(
                 io.github.nicolals.nwc.NwcError.Timeout(
                     message = "Connection lost while waiting for response (request was sent)",
@@ -1136,7 +1114,7 @@ class NwcClient private constructor(
                 )
             )
         } catch (e: Exception) {
-            pendingRequests.remove(requestId)
+            removePendingRequest(requestId)
             io.github.nicolals.nwc.NwcResult.failure(
                 io.github.nicolals.nwc.NwcError.ProtocolError(e.message ?: "Unknown error", e)
             )
@@ -1167,7 +1145,7 @@ class NwcClient private constructor(
             )
         }
 
-        val currentSession = session ?: return io.github.nicolals.nwc.NwcResult.failure(
+        val currentPool = relayPool ?: return io.github.nicolals.nwc.NwcResult.failure(
             io.github.nicolals.nwc.NwcError.ConnectionError("Not connected")
         )
 
@@ -1177,9 +1155,10 @@ class NwcClient private constructor(
             )
         }
 
-        // Check session connection status - fail fast if already disconnected
-        if (currentSession.connectionStatus != ConnectionStatus.Connected) {
-            // Session is not connected (reconnecting, failed, etc.)
+        if (currentPool.connectionStatusFlow.value.values.none {
+                it == ConnectionStatus.Connected
+            }
+        ) {
             return io.github.nicolals.nwc.NwcResult.failure(
                 io.github.nicolals.nwc.NwcError.ConnectionError("Connection lost")
             )
@@ -1194,6 +1173,9 @@ class NwcClient private constructor(
             ctx = ctx,
             clientPrivateKey = connectionUri.secret,
             encryption = encryption,
+            expiration = UnixTimeSeconds(
+                requestExpirationSeconds(UnixTimeSeconds.now().value, timeoutMs)
+            ),
         )
 
         val template = when (templateResult) {
@@ -1211,74 +1193,44 @@ class NwcClient private constructor(
         itemIds.forEach { id ->
             deferreds[id] = CompletableDeferred()
         }
-        pendingMultiRequests[requestId] = deferreds
-
-        // Publish the event and track status
-        val publishHandle = currentSession.publish(signedEvent.event)
-
-        // Track if we ever saw Pending status (meaning bytes were sent to relay)
-        var sawPending = false
-
-        // Wait for publish to be acknowledged by relay
-        val publishStatus = withTimeoutOrNull(PUBLISH_ACK_TIMEOUT_MS) {
-            publishHandle.statusFlow.first { status ->
-                if (status == PublishStatus.Pending) {
-                    sawPending = true
-                }
-                status.isTerminal
-            }
+        pendingMutex.withLock {
+            pendingMultiRequests[requestId] = deferreds
         }
 
-        // Check publish result
-        when (publishStatus) {
-            is PublishStatus.Accepted -> {
-                // Request is on the relay - proceed to wait for responses
-            }
+        val publishHandle = currentPool.publish(signedEvent.event)
 
-            is PublishStatus.Rejected -> {
-                pendingMultiRequests.remove(requestId)
-                return io.github.nicolals.nwc.NwcResult.failure(
-                    io.github.nicolals.nwc.NwcError.ConnectionError(
-                        "Relay rejected request: ${publishStatus.message}"
+        // Track if we ever saw Pending status (meaning bytes were sent to relay)
+        var sawPending = publishHandle.status.values.any {
+            it == PublishStatus.Pending || it is PublishStatus.Accepted
+        }
+
+        // Wait for publish to be acknowledged by relay
+        val publishStatuses = withTimeoutOrNull(PUBLISH_ACK_TIMEOUT_MS) {
+            publishHandle.statusFlow.first { statuses ->
+                if (statuses.values.any { it == PublishStatus.Pending }) {
+                    sawPending = true
+                }
+                statuses.values.any { it is PublishStatus.Accepted } ||
+                    statuses.values.all { it.isTerminal }
+            }
+        }
+        publishHandle.close()
+
+        if (publishStatuses?.values?.none { it is PublishStatus.Accepted } != false) {
+            removePendingMultiRequest(requestId)
+            return if (sawPending) {
+                io.github.nicolals.nwc.NwcResult.failure(
+                    io.github.nicolals.nwc.NwcError.Timeout(
+                        message = "Request may have been published without acknowledgment",
+                        durationMs = PUBLISH_ACK_TIMEOUT_MS
                     )
                 )
-            }
-
-            is PublishStatus.Abandoned, is PublishStatus.Replaced -> {
-                pendingMultiRequests.remove(requestId)
-                return if (sawPending) {
-                    io.github.nicolals.nwc.NwcResult.failure(
-                        io.github.nicolals.nwc.NwcError.Timeout(
-                            message = "Connection lost after sending request",
-                            durationMs = PUBLISH_ACK_TIMEOUT_MS
-                        )
+            } else {
+                io.github.nicolals.nwc.NwcResult.failure(
+                    io.github.nicolals.nwc.NwcError.ConnectionError(
+                        "Request not sent: no relay accepted publication"
                     )
-                } else {
-                    io.github.nicolals.nwc.NwcResult.failure(
-                        io.github.nicolals.nwc.NwcError.ConnectionError("Request not sent: connection failed")
-                    )
-                }
-            }
-
-            null -> {
-                val currentStatus = publishHandle.status
-                pendingMultiRequests.remove(requestId)
-                return if (currentStatus == PublishStatus.Pending || sawPending) {
-                    io.github.nicolals.nwc.NwcResult.failure(
-                        io.github.nicolals.nwc.NwcError.Timeout(
-                            message = "Timeout waiting for relay acknowledgment",
-                            durationMs = PUBLISH_ACK_TIMEOUT_MS
-                        )
-                    )
-                } else {
-                    io.github.nicolals.nwc.NwcResult.failure(
-                        io.github.nicolals.nwc.NwcError.ConnectionError("Request not sent: publish timeout")
-                    )
-                }
-            }
-
-            else -> {
-                // Non-terminal status - continue
+                )
             }
         }
 
@@ -1292,7 +1244,7 @@ class NwcClient private constructor(
                 results
             }
 
-            pendingMultiRequests.remove(requestId)
+            removePendingMultiRequest(requestId)
 
             if (responses == null) {
                 io.github.nicolals.nwc.NwcResult.failure(
@@ -1305,12 +1257,12 @@ class NwcClient private constructor(
                 io.github.nicolals.nwc.NwcResult.success(responses)
             }
         } catch (e: CancellationException) {
-            pendingMultiRequests.remove(requestId)
+            removePendingMultiRequest(requestId)
             throw e
         } catch (e: NwcException) {
             // Connection lost while waiting for responses
             // Since we're past publish-Accepted, the request was sent
-            pendingMultiRequests.remove(requestId)
+            removePendingMultiRequest(requestId)
             io.github.nicolals.nwc.NwcResult.failure(
                 io.github.nicolals.nwc.NwcError.Timeout(
                     message = "Connection lost while waiting for responses (request was sent)",
@@ -1318,10 +1270,23 @@ class NwcClient private constructor(
                 )
             )
         } catch (e: Exception) {
-            pendingMultiRequests.remove(requestId)
+            removePendingMultiRequest(requestId)
             io.github.nicolals.nwc.NwcResult.failure(
                 io.github.nicolals.nwc.NwcError.ProtocolError(e.message ?: "Unknown error", e)
             )
+        }
+    }
+
+    private suspend fun removePendingRequest(requestId: String) {
+        pendingMutex.withLock {
+            pendingRequests.remove(requestId)
+            _pendingRequestCount.value = pendingRequests.size
+        }
+    }
+
+    private suspend fun removePendingMultiRequest(requestId: String) {
+        pendingMutex.withLock {
+            pendingMultiRequests.remove(requestId)
         }
     }
 
@@ -1330,7 +1295,6 @@ class NwcClient private constructor(
     companion object {
         /** Timeout for waiting for relay to acknowledge publish (OK message) */
         private const val PUBLISH_ACK_TIMEOUT_MS = 5_000L
-
         /** Default timeout for WebSocket connection establishment (DNS + TCP + TLS + WS handshake) */
         private const val DEFAULT_CONNECTION_TIMEOUT_MS = 10_000L
 
@@ -1512,6 +1476,24 @@ class NwcClient private constructor(
         }
     }
 }
+
+internal fun isExactResponseMatch(
+    responseRequestId: String?,
+    pendingRequestId: String?,
+    expectedMethod: String?,
+    resultType: String
+): Boolean =
+    responseRequestId != null &&
+        responseRequestId == pendingRequestId &&
+        expectedMethod == resultType
+
+internal fun requestExpirationSeconds(nowSeconds: Long, timeoutMs: Long): Long =
+    nowSeconds + ((timeoutMs + 999L) / 1_000L) + 5L
+
+private data class PendingRequest(
+    val expectedMethod: String,
+    val deferred: CompletableDeferred<NwcResponse>,
+)
 
 /**
  * Result of wallet discovery containing all information needed to display
