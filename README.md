@@ -1,5 +1,17 @@
 # nwc-kmp
 
+> [!IMPORTANT]
+> **This repository is archived.** nwc-kmp first moved into
+> [nostr-kmp](https://github.com/NicolaLS/nostr-kmp), where it fit better as the
+> SDK's higher-level wallet client. Both now live in
+> [Rayl](https://github.com/NicolaLS/rayl), their only user:
+> [`nostr/nwc-kmp`](https://github.com/NicolaLS/rayl/tree/main/nostr/nwc-kmp).
+> It's no longer maintained here, and nothing was released to Maven Central
+> (the old snapshots have expired).
+>
+> If you'd like to use it and want it developed and maintained again, or you'd
+> like to contribute, email [hello@nicolasusca.com](mailto:hello@nicolasusca.com).
+
 `nwc-kmp` is a Kotlin Multiplatform client for Nostr Wallet Connect (NWC,
 NIP-47). It provides a typed API for connecting to an NWC wallet service,
 discovering wallet capabilities, paying invoices, creating invoices, listing
